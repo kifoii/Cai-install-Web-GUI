@@ -202,7 +202,6 @@ class CaiWebApp {
                 this.elements.stAutoUpdateGroup.style.display = showStOptions ? 'block' : 'none';
                 this.elements.addAllDlcGroup.style.display = showStOptions ? 'block' : 'none';
                 this.elements.patchDepotKeyGroup.style.display = showStOptions ? 'block' : 'none'; // NEW: 显示depotkey修补选项
-                this.updateLuaOptionLabels();
                 
                 await this.loadSources();
             } else {
@@ -211,15 +210,6 @@ class CaiWebApp {
         } catch (error) {
             this.elements.configStatus.innerHTML = `<div class="status-item error"><span class="material-icons status-icon">error</span><span class="status-text">无法连接到后端: ${error.message}</span></div>`;
         }
-    }
-
-    updateLuaOptionLabels() {
-        // 这三个选项对 SteamTools 与 OpenSteam 均适用，标签随当前解锁工具变化
-        const toolName = this.unlockerType === 'opensteam' ? 'OpenSteam' : 'SteamTools';
-        const labelEl = document.getElementById('stAutoUpdateLabel');
-        const descEl = document.getElementById('stAutoUpdateDesc');
-        if (labelEl) labelEl.textContent = `${toolName}: 启用自动更新`;
-        if (descEl) descEl.textContent = `让${toolName}自动获取最新清单 (浮动版本)。`;
     }
 
     generateConfigStatusHTML(config) {

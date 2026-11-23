@@ -130,7 +130,7 @@ def get_port_from_gui():
     if os.environ.get('CAI_NO_GUI') == '1':
         return 5000
 
-    # 自动端口：设置里开启后，启动时不再弹窗询问，直接挑一个可用端口
+    # 自动端口：跳过交互，从 5000 起挑选一个可用端口
     if is_auto_port_enabled():
         port = find_free_port(5000)
         return port
@@ -268,8 +268,8 @@ def get_sources():  # 改为同步函数
                 await backend.initialize()
                 
                 # Built-in sources
-                # 说明：printedwaste / cysaw / furcate / walftech / steamdatabase 五个旧 zip 源
-                # 实测已全部失效（404 / 0 字节 / Cloudflare 挑战页 / 403 / 404），不再列出。
+                # printedwaste / cysaw / furcate / walftech / steamdatabase 五个 zip 源当前均不可用
+                # （404 / 空响应 / Cloudflare 挑战页 / 403），故未列入。
                 builtin_sources = {
                     "自动搜索GitHub": "search",
                     "SteamAutoCracks/ManifestHub(2) （仅密钥）": "steamautocracks_v2",
@@ -367,9 +367,7 @@ async def _run_unlock_task(app_id, tool_type, use_st_auto_update, add_all_dlc, p
             
         backend.log.info(f"--- 正在使用源 '{tool_type}' 处理 AppID: {app_id_extracted} ---")
         
-        # 修改这里：添加steamautocracks_v2到zip_sources列表
-        # buqiuren（清单不求人库）同样是「按 depot 直连下载」的自有源，不是 GitHub 分支仓库，
-        # 之前漏在本列表外导致被误送进 process_github_manifest。
+        # 按 depot 直连下载的自有源，走 process_zip_source 而非 process_github_manifest
         zip_sources = ["steamautocracks_v2", "sudama", "buqiuren", "steamtools_games"]
         
         # Check for custom zip sources

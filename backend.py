@@ -26,7 +26,7 @@ from urllib.parse import quote
 CURRENT_VERSION = "2.6"  # 当前版本号
 GITHUB_REPO = "kifoii/Cai-install-Web-GUI"
 
-# --- OpenSteam(OpenSteamKitten) 适配 ---
+# --- OpenSteam(OpenSteamKitten) ---
 OPENSTEAM_EXE_NAME = "OpenSteamKitten.exe"      # OpenSteam 解锁工具可执行文件名
 OPENSTEAM_LUA_SUBDIR = "config/lua"             # OpenSteamKitten 的 lua 配置目录（相对 Steam 根目录）
 
@@ -1321,8 +1321,7 @@ class CaiBackend:
         
         for attempt in range(max_retries):
             try:
-                # Step 1: 直接 GET 站点当前的下载端点（站点已改版，不再需要 session token
-                # 与 POST /api/request-code 换链接）。
+                # GET /api/download_manifest 直接返回 raw manifest，无需 session token。
                 self.log.info(f"正在请求清单: {output_filename} [Depot: {depot_id}, Manifest: {manifest_id}]")
 
                 headers = {
@@ -1463,8 +1462,7 @@ class CaiBackend:
         
         for attempt in range(max_retries):
             try:
-                # 站点已改版：不再需要 session token，也不再走 POST /api/request-code 换下载链接，
-                # 直接 GET /api/download_manifest?depot_id=..&manifest_id=.. 就返回 raw manifest。
+                # GET /api/download_manifest?depot_id=..&manifest_id=.. 返回 raw manifest。
                 self.log.info(f"正在请求清单: {output_filename} [Depot: {depot_id}, Manifest: {manifest_id}]")
 
                 headers = {
@@ -1655,7 +1653,7 @@ class CaiBackend:
             
             self.log.info(f"获取到 {len(depot_manifest_map)} 个 depot 及其 manifest")
 
-            # 2. 获取 Sudama 的所有密钥数据 (改为调用缓存函数)
+            # 2. 获取 Sudama 的所有密钥数据（带缓存）
             sudama_keys = await self._get_cached_sudama_data()
             if not sudama_keys:
                 self.log.error("无法获取 Sudama 密钥库数据")

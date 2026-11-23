@@ -57,6 +57,11 @@
                         <span class="status-text"></span>
                     </div>
                 </div>
+                <div class="input-group">
+                    <label for="opensteamPath" class="input-label">OpenSteamKitten 路径</label>
+                    <input type="text" id="opensteamPath" class="text-field" placeholder="如 C:\Other\Opensteam（留空则自动检测）">
+                    <div class="input-helper">OpenSteam(OpenSteamKitten) 可执行文件所在目录；其 lua 写入位置固定为 Steam 目录下的 config\lua。</div>
+                </div>
             </div>
         </div>
 
@@ -133,6 +138,16 @@
                         </label>
                     </div>
                     <div class="setting-item">
+                        <label class="checkbox-item">
+                            <input type="checkbox" id="autoPort" class="checkbox-input">
+                            <span class="checkbox-button"></span>
+                            <div class="checkbox-content">
+                                <span class="checkbox-label">自动端口</span>
+                                <span class="checkbox-description">开启后启动时不再弹窗询问端口，自动从 5000 起挑选一个可用的端口。</span>
+                            </div>
+                        </label>
+                    </div>
+                    <div class="setting-item">
                         <div class="input-group">
                             <label class="input-label">强制解锁工具模式</label>
                             <div class="radio-group" style="margin-top: 8px;">
@@ -151,8 +166,13 @@
                                     <span class="radio-button"></span>
                                     <span class="radio-label">强制GreenLuma</span>
                                 </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="forceUnlocker" value="opensteam">
+                                    <span class="radio-button"></span>
+                                    <span class="radio-label">强制OpenSteam</span>
+                                </label>
                             </div>
-                            <div class="input-helper">强制使用指定的解锁工具，即使未检测到。程序将自动创建所需的文件夹（如 stplug-in）。</div>
+                            <div class="input-helper">强制使用指定的解锁工具，即使未检测到。程序将自动创建所需的文件夹（SteamTools 为 config\stplug-in，OpenSteam 为 config\lua，GreenLuma 为 AppList）。</div>
                         </div>
                     </div>
                 </div>

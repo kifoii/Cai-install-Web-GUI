@@ -4,6 +4,7 @@ class SettingsManager {
         this.elements = {
             githubToken: document.getElementById('githubToken'),
             steamPath: document.getElementById('steamPath'),
+            opensteamPath: document.getElementById('opensteamPath'),
             steamPathStatus: document.getElementById('steamPathStatus'),
             debugMode: document.getElementById('debugMode'),
             loggingFiles: document.getElementById('loggingFiles'),
@@ -16,6 +17,7 @@ class SettingsManager {
             tokenVisibilityIcon: document.getElementById('tokenVisibilityIcon'),
             toggleConsoleBtn: document.getElementById('toggleConsoleBtn'),
             showConsoleOnStartup: document.getElementById('showConsoleOnStartup'),
+            autoPort: document.getElementById('autoPort'),
             forceUnlockerRadios: document.querySelectorAll('input[name="forceUnlocker"]'),
             // NEW: 自定义清单库相关元素
             checkUpdatesBtn: document.getElementById('checkUpdatesBtn'),
@@ -387,9 +389,11 @@ class SettingsManager {
             if (data.success) {
                 this.elements.githubToken.value = data.config.github_token || '';
                 this.elements.steamPath.value = data.config.steam_path || '';
+                this.elements.opensteamPath.value = data.config.opensteam_path || '';
                 this.elements.debugMode.checked = data.config.debug_mode || false;
                 this.elements.loggingFiles.checked = data.config.logging_files !== false;
                 this.elements.showConsoleOnStartup.checked = data.config.show_console_on_startup || false;
+                this.elements.autoPort.checked = data.config.auto_port || false;
 
                 // 加载强制解锁工具设置
                 const forceUnlockerValue = data.config.force_unlocker_type || 'auto';
@@ -418,9 +422,11 @@ class SettingsManager {
         const config = {
             github_token: this.elements.githubToken.value.trim(),
             steam_path: this.elements.steamPath.value.trim(),
+            opensteam_path: this.elements.opensteamPath.value.trim(),
             debug_mode: this.elements.debugMode.checked,
             logging_files: this.elements.loggingFiles.checked,
             show_console_on_startup: this.elements.showConsoleOnStartup.checked,
+            auto_port: this.elements.autoPort.checked,
             force_unlocker_type: forceUnlockerValue,
             // NEW: 保存自定义清单库配置
             custom_repos: this.customRepos,

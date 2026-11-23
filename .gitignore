@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Nuitka 构建产物
+dist_*/
+*.build/
+*.dist/
+*.onefile-build/
+cai.install.web.ui*.exe
+
+# 运行时数据 / 缓存（本地生成，不入库）
+config.json
+sudama_cache.json
+cache/
+logs/
+temp/
+userdata/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

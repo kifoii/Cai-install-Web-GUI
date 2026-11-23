@@ -67,10 +67,74 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'cai-install-gui-secret-key-v2'
 app.config['USER_DATA_FOLDER'] = project_root / 'userdata'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
-socketio = SocketIO(app, cors_allowed_origins="*")
 
 # --- GUI Port Prompt ---
+def is_port_free(port: int) -> bool:
+    """检查端口是否可用。
+
+    注意：这里不能用 SO_REUSEADDR —— Windows 下它允许 bind() 抢占已被监听的其他
+    进程端口，会让占用检测永远返回 True。改用 SO_EXCLUSIVEADDRUSE（Windows 专有）
+    确保「已被占用」时 bind 一定失败。
+    """
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            s.bind(('127.0.0.1', port))
+            return True
+        except OSError:
+            return False
+
+
+def find_free_port(start: int = 5000, end: int = 5100) -> int:
+    """从 start 开始找第一个可用端口，找不到就返回 start"""
+    for port in range(start, end + 1):
+        if is_port_free(port):
+            return port
+    return start
+
+
+def is_auto_port_enabled() -> bool:
+    """读取 config.json 的 auto_port 开关"""
+    config_path = project_root / 'config.json'
+    if not config_path.exists():
+        return False
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return bool(standard_json.load(f).get("auto_port", False))
+    except Exception:
+        return False
+
+
 def get_port_from_gui():
+    # 非交互启动：优先命令行参数 --port，其次环境变量 CAI_PORT，再其次 CAI_NO_GUI=1 用默认 5000
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == '--port' and i + 1 < len(argv):
+            try:
+                return int(argv[i + 1])
+            except ValueError:
+                pass
+        if a.startswith('--port='):
+            try:
+                return int(a.split('=', 1)[1])
+            except ValueError:
+                pass
+    env_port = os.environ.get('CAI_PORT')
+    if env_port:
+        try:
+            return int(env_port)
+        except ValueError:
+            pass
+    if os.environ.get('CAI_NO_GUI') == '1':
+        return 5000
+
+    # 自动端口：设置里开启后，启动时不再弹窗询问，直接挑一个可用端口
+    if is_auto_port_enabled():
+        port = find_free_port(5000)
+        return port
+
     result = {'port': 5000}
     root = tk.Tk()
     root.title("设置端口")
@@ -204,17 +268,23 @@ def get_sources():  # 改为同步函数
                 await backend.initialize()
                 
                 # Built-in sources
+                # 说明：下列 5 个旧 zip 源已全部失效（2026-11 实测：printedwaste 返回 404、
+                # cysaw 返回 0 字节空响应、furcate 返回 Cloudflare 挑战页、walftech 返回 403、
+                # steamdatabase 返回 404），已从下拉列表移除，避免用户选中后必然失败。
+                # 新增的 ManifestHub3 系库里，实测 manilua-hub / steamtoolsapp / ooiiuur 三个
+                # 与 steamtools-games/ManifestHub3 是同一数据库的克隆（同 appid 的 zip 内容
+                # sha256 完全一致，仅 zip 时间戳字节不同），不提供额外覆盖，因此不再单列。
+                # dc190/ManifestHub 虽只有 271 个分支，但与 ManifestHub3 分支集合不重合
+                # （例如 2928600 只在 dc190 里有），保留作为补充。
                 builtin_sources = {
                     "自动搜索GitHub": "search",
-                    "SWA V2": "printedwaste", 
-                    "Cysaw": "cysaw",
-                    "Furcate": "furcate",
-                    "Walftech": "walftech",
-                    "steamdatabase": "steamdatabase",
+                    "清单不求人库（仅清单）": "buqiuren",
+                    "steamtools.games（6万+分支库）": "steamtools_games",
                     "SteamAutoCracks/ManifestHub(2) （仅密钥）": "steamautocracks_v2",
                     "Sudama库(仅密钥）": "sudama",
-                    "清单不求人库（仅清单）": "buqiuren", 
                     "GitHub (Auiowu)": "Auiowu/ManifestAutoUpdate",
+                    "GitHub (ManifestHub3 主库)": "steamtools-games/ManifestHub3",
+                    "GitHub (dc190 fork)": "dc190/ManifestHub",
                     "GitHub (SAC)": "SteamAutoCracks/ManifestHub"
                 }
                 
@@ -304,7 +374,9 @@ async def _run_unlock_task(app_id, tool_type, use_st_auto_update, add_all_dlc, p
         backend.log.info(f"--- 正在使用源 '{tool_type}' 处理 AppID: {app_id_extracted} ---")
         
         # 修改这里：添加steamautocracks_v2到zip_sources列表
-        zip_sources = ["printedwaste", "cysaw", "furcate", "walftech", "steamdatabase", "steamautocracks_v2", "sudama"]
+        # buqiuren（清单不求人库）同样是「按 depot 直连下载」的自有源，不是 GitHub 分支仓库，
+        # 之前漏在本列表外导致被误送进 process_github_manifest。
+        zip_sources = ["steamautocracks_v2", "sudama", "buqiuren", "steamtools_games"]
         
         # Check for custom zip sources
         if tool_type.startswith("custom_zip_"):
@@ -478,6 +550,8 @@ def open_manager_folder():
             path_to_open = backend.steam_path / 'config' / 'stplug-in'
         elif folder_type == 'gl' and backend.steam_path:
             path_to_open = backend.steam_path / 'AppList'
+        elif folder_type == 'os' and backend.steam_path:
+            path_to_open = backend.steam_path / 'config' / 'lua'
         
         if path_to_open and path_to_open.exists():
             os.startfile(path_to_open)
@@ -487,7 +561,124 @@ def open_manager_folder():
     except Exception as e:
         return jsonify({"success": False, "message": f"打开目录失败: {e}"}), 500
 
+@app.route('/api/manager/file_content', methods=['GET', 'POST'])
+def manager_file_content():
+    data = request.get_json(silent=True) if request.method == 'POST' else request.args
+    file_type = (data.get('type') if data else None) or request.args.get('type')
+    filename = (data.get('filename') if data else None) or request.args.get('filename')
+
+    if not file_type or not filename:
+        return jsonify({"success": False, "message": "请求参数无效。"}), 400
+
+    try:
+        if request.method == 'GET':
+            async def _get():
+                async with CaiBackend() as backend:
+                    await backend.initialize()
+                    return backend.get_file_content(file_type, filename)
+            result = asyncio.run(_get())
+            return jsonify(result)
+        else:
+            content = data.get('content', '')
+            async def _save():
+                async with CaiBackend() as backend:
+                    await backend.initialize()
+                    return backend.save_file_content(file_type, filename, content)
+            result = asyncio.run(_save())
+            return jsonify(result)
+    except Exception as e:
+        dummy_backend = CaiBackend()
+        message = f"文件内容操作失败: {str(e)}"
+        dummy_backend.log.error(dummy_backend.stack_error(e))
+        return jsonify({"success": False, "message": message}), 500
+
+@app.route('/api/manager/force_unlock', methods=['POST'])
+def manager_force_unlock():
+    data = request.get_json()
+    appid = data.get('appid')
+    action = data.get('action', 'add')
+
+    if not appid:
+        return jsonify({"success": False, "message": "请求参数无效。"}), 400
+
+    try:
+        async def _force():
+            async with CaiBackend() as backend:
+                await backend.initialize()
+                return await backend.force_unlock(appid, action)
+        result = asyncio.run(_force())
+        return jsonify(result)
+    except Exception as e:
+        dummy_backend = CaiBackend()
+        message = f"强制解锁操作失败: {str(e)}"
+        dummy_backend.log.error(dummy_backend.stack_error(e))
+        return jsonify({"success": False, "message": message}), 500
+
 # --- END of File Manager API ---
+
+# 封面图代理：浏览器在国内直连 Steam CDN 会 ERR_CONNECTION_CLOSED / ERR_BLOCKED_BY_ORB，
+# 由后端取图后本地回传，并落地磁盘缓存避免重复拉取。
+_COVER_CACHE_DIR = project_root / 'cache' / 'covers'
+_ALLOWED_COVER_HOSTS = (
+    'steamstatic.com',
+    'steampowered.com',
+    'akamaihd.net',
+)
+
+
+@app.route('/api/cover/<appid>')
+def cover_image(appid):
+    import httpx
+    from flask import Response
+
+    if not appid.isdigit():
+        return ('', 400)
+
+    cache_file = _COVER_CACHE_DIR / f'{appid}.jpg'
+    if cache_file.exists() and cache_file.stat().st_size > 0:
+        return Response(cache_file.read_bytes(), mimetype='image/jpeg',
+                        headers={'Cache-Control': 'public, max-age=604800'})
+
+    candidates = [
+        f'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{appid}/header.jpg',
+        f'https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg',
+        f'https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/{appid}/header.jpg',
+        f'https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg',
+        f'https://steamcdn-a.akamaihd.net/steam/apps/{appid}/header.jpg',
+    ]
+
+    # 先尝试商店接口拿到带 hash 的准确地址（旧路径对新游戏是 404）
+    try:
+        r = httpx.get('https://store.steampowered.com/api/appdetails',
+                      params={'appids': appid, 'l': 'schinese'},
+                      headers={'User-Agent': 'Mozilla/5.0'}, timeout=12, verify=False)
+        if r.status_code == 200:
+            node = (r.json() or {}).get(str(appid)) or {}
+            header_image = ((node.get('data') or {}).get('header_image') or '').strip()
+            if header_image:
+                candidates.insert(0, header_image)
+    except Exception:
+        pass
+
+    for url in candidates:
+        host_ok = any(url.split('/')[2].endswith(h) for h in _ALLOWED_COVER_HOSTS)
+        if not host_ok:
+            continue
+        try:
+            resp = httpx.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15,
+                             follow_redirects=True, verify=False)
+            if resp.status_code == 200 and resp.content[:3] == b'\xff\xd8\xff':
+                try:
+                    _COVER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    cache_file.write_bytes(resp.content)
+                except Exception:
+                    pass
+                return Response(resp.content, mimetype='image/jpeg',
+                                headers={'Cache-Control': 'public, max-age=604800'})
+        except Exception:
+            continue
+
+    return ('', 404)
 
 
 @app.route('/api/config/detailed')
@@ -506,6 +697,7 @@ def get_detailed_config():
         return jsonify({"success": True, "config": {
             "github_token": config.get("Github_Personal_Token", ""),
             "steam_path": str(steam_path_str),
+            "opensteam_path": config.get("OpenSteam_Path", ""),
             "debug_mode": config.get("debug_mode", False),
             "logging_files": config.get("logging_files", True),
             "steam_path_is_auto": steam_path_is_auto,
@@ -514,6 +706,7 @@ def get_detailed_config():
             "background_saturation": config.get("background_saturation", 100),
             "background_brightness": config.get("background_brightness", 100),
             "show_console_on_startup": config.get("show_console_on_startup", False),
+            "auto_port": config.get("auto_port", False),
             "force_unlocker_type": config.get("force_unlocker_type", "auto"),
             # NEW: 添加自定义清单库配置
             "custom_repos": config.get("Custom_Repos", {"github": [], "zip": []}),
@@ -540,13 +733,14 @@ def update_config():  # 改为同步函数
         
         # 更新所有可能的键
         updatable_keys = [
-            "github_token", "steam_path", "debug_mode", "logging_files",
+            "github_token", "steam_path", "opensteam_path", "debug_mode", "logging_files",
             "background_image_path", "background_blur", "background_saturation", 
-            "background_brightness", "show_console_on_startup", "force_unlocker_type"
+            "background_brightness", "show_console_on_startup", "auto_port", "force_unlocker_type"
         ]
         key_map = {
             "github_token": "Github_Personal_Token",
-            "steam_path": "Custom_Steam_Path"
+            "steam_path": "Custom_Steam_Path",
+            "opensteam_path": "OpenSteam_Path"
         }
         
         for key in updatable_keys:

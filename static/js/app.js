@@ -198,10 +198,11 @@ class CaiWebApp {
                 this.elements.configStatus.innerHTML = this.generateConfigStatusHTML(data);
                 this.elements.unlockBtn.disabled = false;
                 
-                const showStOptions = this.unlockerType === 'steamtools';
+                const showStOptions = this.unlockerType === 'steamtools' || this.unlockerType === 'opensteam';
                 this.elements.stAutoUpdateGroup.style.display = showStOptions ? 'block' : 'none';
                 this.elements.addAllDlcGroup.style.display = showStOptions ? 'block' : 'none';
                 this.elements.patchDepotKeyGroup.style.display = showStOptions ? 'block' : 'none'; // NEW: 显示depotkey修补选项
+                this.updateLuaOptionLabels();
                 
                 await this.loadSources();
             } else {
@@ -212,12 +213,22 @@ class CaiWebApp {
         }
     }
 
+    updateLuaOptionLabels() {
+        // 这三个选项对 SteamTools 与 OpenSteam 均适用，标签随当前解锁工具变化
+        const toolName = this.unlockerType === 'opensteam' ? 'OpenSteam' : 'SteamTools';
+        const labelEl = document.getElementById('stAutoUpdateLabel');
+        const descEl = document.getElementById('stAutoUpdateDesc');
+        if (labelEl) labelEl.textContent = `${toolName}: 启用自动更新`;
+        if (descEl) descEl.textContent = `让${toolName}自动获取最新清单 (浮动版本)。`;
+    }
+
     generateConfigStatusHTML(config) {
         const items = [];
         const unlockerStatusMap = {
             'steamtools': { class: 'success', text: '已检测到 SteamTools', icon: 'check_circle' },
+            'opensteam': { class: 'success', text: '已检测到 OpenSteam (OpenSteamKitten)', icon: 'check_circle' },
             'greenluma': { class: 'success', text: '已检测到 GreenLuma', icon: 'check_circle' },
-            'conflict': { class: 'error', text: '冲突: 同时检测到两种工具!', icon: 'error' },
+            'conflict': { class: 'error', text: '冲突: 检测到多种解锁工具!', icon: 'error' },
             'none': { class: 'warning', text: '未检测到解锁工具。', icon: 'warning' },
         };
         const status = unlockerStatusMap[config.unlocker_type] || unlockerStatusMap.none;

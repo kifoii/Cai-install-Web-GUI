@@ -48,6 +48,7 @@ class FileManagerApp {
         document.getElementById('forceUnlockAdd').addEventListener('click', () => this.handleForceUnlock('add'));
         document.getElementById('forceUnlockRemove').addEventListener('click', () => this.handleForceUnlock('remove'));
         document.getElementById('openStFolder').addEventListener('click', () => this.openFolder('st'));
+        document.getElementById('openOsFolder').addEventListener('click', () => this.openFolder('os'));
         document.getElementById('openGlFolder').addEventListener('click', () => this.openFolder('gl'));
 
         // Context Menu
@@ -130,7 +131,8 @@ class FileManagerApp {
                 const statusInfo = statusMap[item.status] || { text: '未知', class: '' };
                 const isCoreFile = item.status === 'core_file';
                 const hasValidAppID = item.appid && /^\d+$/.test(item.appid);
-                const imageUrl = hasValidAppID ? `https://cdn.akamai.steamstatic.com/steam/apps/${item.appid}/header.jpg` : '';
+                // 走本地后端代理，避免浏览器直连 Steam CDN 被断连/ORB 拦截
+                const imageUrl = hasValidAppID ? `/api/cover/${item.appid}` : '';
                 
                 const imageHtml = hasValidAppID 
                     ? `<img src="${imageUrl}" alt="${item.game_name || 'Game Cover'}" loading="lazy" onerror="this.parentElement.innerHTML = '<div class=\\'placeholder\\'><span class=\\'material-icons\\'>hide_image</span></div>';">`
@@ -257,8 +259,18 @@ class FileManagerApp {
             if (appid !== null) alert('请输入有效的数字AppID。');
             return;
         }
-        // This is a placeholder for the actual API call.
-        this.showSnackbar(`正在为AppID ${appid} 执行 '${action}' 操作... (API待实现)`, 'info');
+        try {
+            const response = await fetch('/api/manager/force_unlock', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ appid: appid, action: action })
+            });
+            const result = await response.json();
+            this.showSnackbar(result.message, result.success ? 'success' : 'error');
+            if (result.success) { await this.fetchFiles(); }
+        } catch (error) {
+            this.showSnackbar(`操作失败: ${error.message}`, 'error');
+        }
     }
 
     showContextMenu(e) {
@@ -345,12 +357,6 @@ class FileManagerApp {
         this.elements.saveEditorBtn.disabled = true;
         this.elements.editorModal.classList.add('show');
 
-        // Fetch file content (API endpoint to be created in backend)
-        this.showSnackbar('编辑功能需要后端支持来读取和保存文件内容。', 'warning');
-        this.elements.editorTextarea.value = `// 后端API 'GET /api/manager/file_content' 尚待实现。\n// 后端API 'POST /api/manager/file_content' 尚待实现。`;
-
-        /* 
-        // NOTE: The following code requires backend implementation.
         try {
             const response = await fetch(`/api/manager/file_content?type=${this.currentTab}&filename=${encodeURIComponent(item.filename)}`);
             if (!response.ok) throw new Error('无法加载文件。');
@@ -367,7 +373,6 @@ class FileManagerApp {
             this.elements.editorTextarea.value = `加载失败: ${e.message}`;
             this.elements.editorStatus.textContent = '加载失败';
         }
-        */
     }
 
     hideEditor() {
@@ -381,11 +386,7 @@ class FileManagerApp {
         const content = this.elements.editorTextarea.value;
         this.elements.saveEditorBtn.disabled = true;
         this.elements.saveEditorBtn.innerHTML = `<span class="material-icons spin">hourglass_top</span> 保存中...`;
-        
-        // NOTE: This requires backend implementation
-        this.showSnackbar('保存功能需要后端API支持。', 'warning');
 
-        /*
         try {
             const response = await fetch('/api/manager/file_content', {
                 method: 'POST',
@@ -400,6 +401,7 @@ class FileManagerApp {
             this.showSnackbar(result.message, result.success ? 'success' : 'error');
             if (result.success) {
                 this.hideEditor();
+                await this.fetchFiles();
             }
         } catch (e) {
             this.showSnackbar(`保存失败: ${e.message}`, 'error');
@@ -407,14 +409,6 @@ class FileManagerApp {
             this.elements.saveEditorBtn.disabled = false;
             this.elements.saveEditorBtn.innerHTML = `<span class="material-icons">save</span> 保存`;
         }
-        */
-       
-        // Mockup behaviour
-        setTimeout(() => {
-             this.elements.saveEditorBtn.disabled = false;
-             this.elements.saveEditorBtn.innerHTML = `<span class="material-icons">save</span> 保存`;
-             this.hideEditor();
-        }, 1000);
     }
 
     // --- Snackbar and Shutdown ---

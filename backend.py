@@ -23,8 +23,12 @@ from pathlib import Path
 from typing import Tuple, Any, List, Dict, Literal
 from urllib.parse import quote
 
-CURRENT_VERSION = "2.5"  # 当前版本号
-GITHUB_REPO = "pvzcxw/Cai-install-Web-GUI" 
+CURRENT_VERSION = "2.6"  # 当前版本号
+GITHUB_REPO = "kifoii/Cai-install-Web-GUI"
+
+# --- OpenSteam(OpenSteamKitten) 适配 ---
+OPENSTEAM_EXE_NAME = "OpenSteamKitten.exe"      # OpenSteam 解锁工具可执行文件名
+OPENSTEAM_LUA_SUBDIR = "config/lua"             # OpenSteamKitten 的 lua 配置目录（相对 Steam 根目录）
 
 # --- LOGGING SETUP ---
 LOG_FORMAT = '%(log_color)s%(message)s'
@@ -39,6 +43,7 @@ LOG_COLORS = {
 DEFAULT_CONFIG = {
     "Github_Personal_Token": "",
     "Custom_Steam_Path": "",
+    "OpenSteam_Path": "",
     "debug_mode": False,
     "logging_files": True,
     "background_image_path": "",
@@ -46,6 +51,7 @@ DEFAULT_CONFIG = {
     "background_saturation": 100,
     "background_brightness": 80, 
     "show_console_on_startup": False,
+    "auto_port": False,
     "force_unlocker_type": "auto",
     "Custom_Repos": {
         "github": [],
@@ -99,6 +105,7 @@ class CaiBackend:
         self.temp_path = self.project_root / 'temp'
         self.log = self._init_log()
         self.name_cache: Dict[str, str] = {} # NEW: 添加游戏名称缓存
+        self.cover_cache: Dict[str, str] = {} # NEW: 游戏封面缓存（appid -> 可用图片URL）
 
     async def __aenter__(self):
         self.client = httpx.AsyncClient(verify=False, trust_env=True)
@@ -281,7 +288,7 @@ class CaiBackend:
             self.log.warning(f"检查更新失败: {e}")
             return False, {}
 
-    async def initialize(self) -> Literal["steamtools", "greenluma", "conflict", "none", None]:
+    async def initialize(self) -> Literal["steamtools", "greenluma", "opensteam", "conflict", "none", None]:
         if not self.config: self.config = await self.load_config()
         if self.config is None: return None
         self._configure_logger()
@@ -294,15 +301,20 @@ class CaiBackend:
 
         force_unlocker = self.config.get("force_unlocker_type", "auto")
 
-        if force_unlocker in ["steamtools", "greenluma"]:
+        if force_unlocker in ["steamtools", "greenluma", "opensteam"]:
             self.unlocker_type = force_unlocker
             self.log.warning(f"已根据配置强制使用解锁工具: {force_unlocker.capitalize()}")
         else:
-            is_steamtools = (self.steam_path / 'config' / 'stplug-in').is_dir()
+            is_steamtools = self._detect_steamtools()
             is_greenluma = any((self.steam_path / dll).exists() for dll in ['GreenLuma_2025_x86.dll', 'GreenLuma_2025_x64.dll'])
-            if is_steamtools and is_greenluma:
-                self.log.error("环境冲突：同时检测到SteamTools和GreenLuma！请在设置中强制指定一个。")
+            is_opensteam = self._detect_opensteam()
+            detected = [name for name, ok in (("steamtools", is_steamtools), ("greenluma", is_greenluma), ("opensteam", is_opensteam)) if ok]
+            if len(detected) >= 2:
+                self.log.error(f"环境冲突：同时检测到 {len(detected)} 种解锁工具 ({', '.join(detected)})！请在设置中强制指定一个。")
                 self.unlocker_type = "conflict"
+            elif is_opensteam:
+                self.log.info("自动检测到解锁工具: OpenSteam (OpenSteamKitten)")
+                self.unlocker_type = "opensteam"
             elif is_steamtools:
                 self.log.info("自动检测到解锁工具: SteamTools")
                 self.unlocker_type = "steamtools"
@@ -319,10 +331,106 @@ class CaiBackend:
             (self.steam_path / 'depotcache').mkdir(parents=True, exist_ok=True)
             # Create config/depotcache for workshop manifests
             (self.steam_path / 'config' / 'depotcache').mkdir(parents=True, exist_ok=True)
+            # Create OpenSteamKitten lua directory (config/lua)
+            (self.steam_path / OPENSTEAM_LUA_SUBDIR).mkdir(parents=True, exist_ok=True)
         except Exception as e:
             self.log.error(f"创建Steam子目录时失败: {e}")
 
         return self.unlocker_type
+
+    def _detect_steamtools(self) -> bool:
+        """检测 SteamTools 是否处于启用状态。
+
+        仅凭 config/stplug-in 目录存在不能判定（该目录可能只是历史残留或空目录），
+        需满足以下任一条件：
+        1. config/stplug-in 下存在实际 .lua 解锁文件；
+        2. Steam 根目录存在 SteamTools 的 core 注入文件（SteamTools.dll / SteamTools.Cfg 等）；
+        3. 同级目录存在 SteamTools.exe 安装。
+        注意：SteamTools 与 OpenSteam 会共用部分注入 dll 名，故优先用 lua 文件判定。
+        """
+        if not self.steam_path:
+            return False
+
+        st_dir = self.steam_path / 'config' / 'stplug-in'
+        if st_dir.is_dir():
+            try:
+                if any(p.suffix.lower() == '.lua' for p in st_dir.iterdir() if p.is_file()):
+                    return True
+            except OSError:
+                pass
+
+        return False
+
+    def _detect_opensteam(self) -> bool:
+        """检测 OpenSteam(OpenSteamKitten) 是否可用。
+
+        判定条件（满足其一即可）：
+        1. Steam 根目录存在 OpenSteam 注入 dll（OpenSteamTool.dll）；
+        2. Steam 根目录下存在 config/lua 目录且其中有 .lua 解锁文件；
+        3. 配置中的 OpenSteam_Path 指向存在 OpenSteamKitten.exe 的目录；
+        4. Steam 根目录或其父目录存在 OpenSteamKitten.exe。
+        """
+        configured = (self.config.get("OpenSteam_Path") or "").strip()
+        if configured:
+            candidate = Path(configured)
+            if (candidate / OPENSTEAM_EXE_NAME).is_file():
+                return True
+            if candidate.is_dir() and (candidate / 'Resources' / 'dlls').is_dir():
+                return True
+
+        if not self.steam_path:
+            return False
+
+        # 1. 注入 dll 存在即视为已部署 OpenSteam
+        if (self.steam_path / 'OpenSteamTool.dll').is_file():
+            return True
+
+        # 2. config/lua 目录内有实际 lua 解锁文件
+        lua_dir = self.steam_path / OPENSTEAM_LUA_SUBDIR
+        if lua_dir.is_dir():
+            try:
+                if any(p.suffix.lower() == '.lua' for p in lua_dir.iterdir() if p.is_file()):
+                    return True
+            except OSError:
+                pass
+
+        # 3. 兜底：Steam 根目录或其父目录存在 OpenSteamKitten.exe
+        for base in (self.steam_path, self.steam_path.parent):
+            try:
+                if base and (base / OPENSTEAM_EXE_NAME).is_file():
+                    return True
+            except OSError:
+                pass
+        return False
+
+    def _is_lua_unlocker(self, unlocker_type: str) -> bool:
+        """是否为基于 lua 文件的解锁工具（SteamTools / OpenSteam）。"""
+        return unlocker_type in ("steamtools", "opensteam")
+
+    def _lua_write_dir(self, unlocker_type: str) -> Path:
+        """返回指定解锁工具的 lua 写入目录。
+        SteamTools -> <Steam>/config/stplug-in
+        OpenSteam  -> <Steam>/config/lua
+        """
+        if unlocker_type == "opensteam":
+            return self.steam_path / OPENSTEAM_LUA_SUBDIR
+        return self.steam_path / 'config' / 'stplug-in'
+
+    def _get_opensteam_exe_path(self) -> Path | None:
+        """定位 OpenSteamKitten.exe 可执行文件路径。
+        优先使用配置 OpenSteam_Path，其次 Steam 根目录 / 父目录。"""
+        configured = (self.config.get("OpenSteam_Path") or "").strip()
+        candidates = []
+        if configured:
+            candidates.append(Path(configured) / OPENSTEAM_EXE_NAME)
+            candidates.append(Path(configured))
+        if self.steam_path:
+            candidates.append(self.steam_path / OPENSTEAM_EXE_NAME)
+            candidates.append(self.steam_path.parent / OPENSTEAM_EXE_NAME)
+        for c in candidates:
+            if c.is_file():
+                return c
+        return None
 
     def stack_error(self, exception: Exception) -> str:
         return ''.join(traceback.format_exception(type(exception), exception, exception.__traceback__))
@@ -396,38 +504,142 @@ class CaiBackend:
 
         url = f"https://api.xiaoheihe.cn/game/share_game_detail?appid={appid}"
         try:
-            # 使用现有client
-            response = await self.client.get(url, headers={'User-Agent': 'Cai-Install-Manager/1.0'})
+            response = await self.client.get(url, headers={'User-Agent': 'Cai-Install-Manager/1.0'}, follow_redirects=True)
             response.raise_for_status()
-            html_content = response.text
-            
-            # 使用正则表达式从HTML中提取<title>标签的内容
-            title_match = re.search(r'<title>(.*?)</title>', html_content, re.IGNORECASE)
-            
-            if title_match:
-                name = title_match.group(1).strip()
-                # 小黑盒的标题可能包含 "-小黑盒" 后缀，需要移除
-                if " - 小黑盒" in name:
-                    name = name.replace(" - 小黑盒", "").strip()
+
+            # 小黑盒接口会 302 到分享页，游戏名在最终 URL 的 title 查询参数里
+            name = self._extract_name_from_url(str(response.url))
+            if not name:
+                title_match = re.search(r'<title>(.*?)</title>', response.text, re.IGNORECASE)
+                if title_match:
+                    name = title_match.group(1).strip()
+                    if " - 小黑盒" in name:
+                        name = name.replace(" - 小黑盒", "").strip()
+
+            # 过滤掉小黑盒的站点级占位标题
+            if name and name not in ("小黑盒 - 玩家高能聚集地", "小黑盒"):
                 self.name_cache[appid] = name
                 return name
-            
-            return "名称未找到"
+
+            # 回退：Steam 官方商店接口
+            steam_name = await self._fetch_steam_store_name(appid)
+            if steam_name:
+                self.name_cache[appid] = steam_name
+                return steam_name
+
+            return name or "名称未找到"
         except Exception as e:
             self.log.warning(f"从小黑盒获取 AppID {appid} 的名称失败: {e}")
+            try:
+                steam_name = await self._fetch_steam_store_name(appid)
+                if steam_name:
+                    self.name_cache[appid] = steam_name
+                    return steam_name
+            except Exception:
+                pass
             return "获取失败"
+
+    @staticmethod
+    def _extract_name_from_url(url: str) -> str | None:
+        """从分享页 URL 的 title 参数中还原游戏名。"""
+        try:
+            from urllib.parse import urlparse, parse_qs, unquote
+            qs = parse_qs(urlparse(url).query)
+            raw = (qs.get('title') or [None])[0]
+            if raw:
+                name = unquote(raw).strip()
+                if name and name not in ("小黑盒 - 玩家高能聚集地", "小黑盒"):
+                    return name
+        except Exception:
+            pass
+        return None
+
+    async def _fetch_steam_store_name(self, appid: str) -> str | None:
+        """回退方案：调用 Steam 官方商店接口取游戏名。"""
+        for lang in ('schinese', 'english'):
+            try:
+                r = await self.client.get(
+                    "https://store.steampowered.com/api/appdetails",
+                    params={'appids': appid, 'l': lang},
+                    headers={'User-Agent': 'Mozilla/5.0'},
+                    follow_redirects=True,
+                )
+                if r.status_code != 200:
+                    continue
+                payload = r.json()
+                node = payload.get(str(appid)) or payload.get(appid)
+                if isinstance(node, dict) and node.get('success'):
+                    name = (node.get('data') or {}).get('name')
+                    if name:
+                        return str(name).strip()
+            except Exception:
+                continue
+        return None
+
+    async def _fetch_steam_app_info(self, appid: str) -> dict:
+        """调用 Steam 商店接口取 appdetails 的 data 字段，失败返回 {}。"""
+        for lang in ('schinese', 'english'):
+            try:
+                r = await self.client.get(
+                    "https://store.steampowered.com/api/appdetails",
+                    params={'appids': appid, 'l': lang},
+                    headers={'User-Agent': 'Mozilla/5.0'},
+                    follow_redirects=True,
+                    timeout=15,
+                )
+                if r.status_code != 200:
+                    continue
+                payload = r.json()
+                node = payload.get(str(appid)) or payload.get(appid)
+                if isinstance(node, dict) and node.get('success'):
+                    data = node.get('data') or {}
+                    if data:
+                        return data
+            except Exception:
+                continue
+        return {}
+
+    async def _resolve_cover_url(self, appid: str) -> str:
+        """解析游戏封面地址。
+
+        Steam 在 2026 年前后把图片路径从
+          cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg
+        迁移到
+          shared.akamai.steamstatic.com/store_item_assets/steam/apps/{appid}/{hash}/header.jpg
+        新上架的游戏在旧路径下完全没有图片（404），必须走商店接口拿带 hash 的新地址。
+        这里先查商店接口，拿不到再退回旧路径，保证老游戏也能显示。
+        """
+        if not appid or not appid.isdigit():
+            return ''
+        if appid in self.cover_cache:
+            return self.cover_cache[appid]
+
+        fallback = f"https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg"
+        try:
+            data = await self._fetch_steam_app_info(appid)
+            header_image = (data.get('header_image') or '').strip()
+            if header_image:
+                # 商店接口给的是 schinese 版本，若取不到可退化到同名英文图
+                self.cover_cache[appid] = header_image
+                return header_image
+        except Exception as e:
+            self.log.warning(f"获取 AppID {appid} 的封面图地址失败: {e}")
+
+        self.cover_cache[appid] = fallback
+        return fallback
             
     async def get_managed_files(self) -> Dict:
         """扫描所有相关目录，返回文件信息，并批量获取游戏名称。"""
         if not self.steam_path or not self.steam_path.exists():
             return {"error": "Steam路径未配置或无效。"}
 
-        file_data = {"st": [], "gl": [], "assistant": []}
+        file_data = {"st": [], "gl": [], "os": [], "assistant": []}
         all_appids_to_fetch = set()
 
         # 1. 扫描文件并收集AppID
         st_path = self.steam_path / 'config' / 'stplug-in'
         gl_path = self.steam_path / 'AppList'
+        os_path = self.steam_path / OPENSTEAM_LUA_SUBDIR
 
         # SteamTools
         if st_path.exists():
@@ -439,6 +651,11 @@ class CaiBackend:
             file_data['gl'], gl_appids = self._scan_generic_files(gl_path, ".txt")
             all_appids_to_fetch.update(gl_appids)
 
+        # OpenSteam (OpenSteamKitten)：lua 语法与 SteamTools 一致，仅目录不同
+        if os_path.exists():
+            file_data['os'], os_appids = self._scan_st_files(os_path, core_filename="steamtools.lua", core_label="OpenSteam核心文件")
+            all_appids_to_fetch.update(os_appids)
+
         # 2. 批量获取游戏名称
         # 过滤掉已在缓存中的AppID
         appids_to_fetch = [appid for appid in all_appids_to_fetch if appid not in self.name_cache]
@@ -448,21 +665,33 @@ class CaiBackend:
             for appid, name in zip(appids_to_fetch, results):
                 self.name_cache[appid] = name
 
-        # 3. 将获取到的名称填充回数据
+        # 2.5 批量解析封面图地址（Steam 已迁移到带 hash 的新路径，旧路径对新游戏 404）
+        cover_appids = [appid for appid in all_appids_to_fetch if appid and appid.isdigit() and appid not in self.cover_cache]
+        if cover_appids:
+            cover_results = await asyncio.gather(*[self._resolve_cover_url(appid) for appid in cover_appids])
+            for appid, url in zip(cover_appids, cover_results):
+                if url:
+                    self.cover_cache[appid] = url
+
+        # 3. 将获取到的名称与封面填充回数据
         for category in file_data:
             for item in file_data[category]:
                 if item['appid'] in self.name_cache:
                     item['game_name'] = self.name_cache[item['appid']]
-        
+                cover = self.cover_cache.get(item['appid'])
+                if cover:
+                    item['cover_url'] = cover
+
         return file_data
 
-    def _scan_st_files(self, directory: Path) -> Tuple[List[Dict], set]:
-        """扫描SteamTools目录，返回文件数据和AppID集合。"""
+    def _scan_st_files(self, directory: Path, core_filename: str = "steamtools.lua", core_label: str = "SteamTools核心文件") -> Tuple[List[Dict], set]:
+        """扫描SteamTools风格目录（.lua），返回文件数据和AppID集合。
+        同时兼容 OpenSteamKitten 的 config/lua 目录（语法相同，仅目录不同）。"""
         data, appids = [], set()
         file_data_map = {}
         try:
             for filename in os.listdir(directory):
-                if filename.endswith(".lua") and filename != "steamtools.lua":
+                if filename.endswith(".lua") and filename != core_filename:
                     content = (directory / filename).read_text(encoding='utf-8', errors='ignore')
                     match = re.search(r'addappid\s*\(\s*(\d+)', content)
                     appid = match.group(1) if match else "N/A"
@@ -470,9 +699,9 @@ class CaiBackend:
                         appids.add(appid)
                         file_data_map[appid] = {"filename": filename, "appid": appid, "game_name": "加载中...", "status": "ok"}
             
-            st_lua_path = directory / "steamtools.lua"
+            st_lua_path = directory / core_filename
             if st_lua_path.exists():
-                data.append({"filename": "steamtools.lua", "appid": "N/A", "game_name": "SteamTools核心文件", "status": "core_file"})
+                data.append({"filename": core_filename, "appid": "N/A", "game_name": core_label, "status": "core_file"})
                 content = st_lua_path.read_text(encoding='utf-8', errors='ignore')
                 # --- CRITICAL FIX: Use a more general regex to find all appids ---
                 unlocked_appids = set(re.findall(r'addappid\s*\(\s*(\d+)', content))
@@ -481,7 +710,7 @@ class CaiBackend:
                         appids.add(appid)
                         file_data_map[appid] = {"filename": f"缺少 {appid}.lua", "appid": appid, "game_name": "加载中...", "status": "unlocked_only"}
         except Exception as e:
-            self.log.error(f"扫描SteamTools目录失败: {e}")
+            self.log.error(f"扫描SteamTools风格目录失败: {e}")
         
         data.extend(sorted(file_data_map.values(), key=lambda item: int(item.get('appid', 0)), reverse=True))
         return data, appids
@@ -532,6 +761,8 @@ class CaiBackend:
             base_path = self.steam_path / 'config' / 'stplug-in'
         elif file_type == 'gl':
             base_path = self.steam_path / 'AppList'
+        elif file_type == 'os':
+            base_path = self.steam_path / OPENSTEAM_LUA_SUBDIR
         
         if not base_path:
             return {"success": False, "message": f"未知的类型: {file_type}。"}
@@ -540,9 +771,12 @@ class CaiBackend:
         
         for item in items:
             try:
-                # 步骤1: 如果是ST类型，清理 steamtools.lua 中的解锁条目
-                if file_type == 'st' and item.get('status') != 'core_file' and item.get('appid', 'N/A').isdigit():
-                    self._modify_st_lua_for_delete(item['appid'])
+                # 步骤1: 如果是ST/OS类型，清理核心lua中的解锁条目
+                if file_type in ('st', 'os') and item.get('status') != 'core_file' and item.get('appid', 'N/A').isdigit():
+                    if file_type == 'st':
+                        self._modify_st_lua_for_delete(item['appid'])
+                    else:
+                        self._modify_st_lua_for_delete(item['appid'], lua_dir=self.steam_path / OPENSTEAM_LUA_SUBDIR)
 
                 # 步骤2: 清理物理文件和关联的 manifest
                 filename = item.get('filename')
@@ -550,7 +784,7 @@ class CaiBackend:
                     file_path = base_path / filename
                     if file_path.exists() and file_path.is_file():
                         # --- NEW: Logic to clean up associated manifest files ---
-                        if file_type == 'st' and filename.endswith('.lua'):
+                        if file_type in ('st', 'os') and filename.endswith('.lua'):
                             try:
                                 content = file_path.read_text(encoding='utf-8', errors='ignore')
                                 gids = re.findall(r'setManifestid\s*\(\s*\d+\s*,\s*"(\d+)"\s*\)', content)
@@ -585,9 +819,12 @@ class CaiBackend:
         return {"success": not failed, "message": message}
 
 
-    def _modify_st_lua_for_delete(self, appid: str):
-        """从steamtools.lua中移除一个解锁条目。"""
-        st_lua_path = self.steam_path / 'config' / 'stplug-in' / "steamtools.lua"
+    def _modify_st_lua_for_delete(self, appid: str, lua_dir: Path = None, core_filename: str = "steamtools.lua"):
+        """从核心lua（默认 steamtools.lua）中移除一个解锁条目。
+        lua_dir 用于指定目标目录（如 OpenSteamKitten 的 config/lua）。"""
+        if lua_dir is None:
+            lua_dir = self.steam_path / 'config' / 'stplug-in'
+        st_lua_path = lua_dir / core_filename
         if not st_lua_path.exists(): return
 
         try:
@@ -600,11 +837,110 @@ class CaiBackend:
                 # 清理空行
                 new_content_cleaned = "\n".join(line for line in new_content.splitlines() if line.strip())
                 st_lua_path.write_text(new_content_cleaned + "\n" if new_content_cleaned else "", encoding='utf-8')
-                self.log.info(f"已从 steamtools.lua 移除 AppID {appid} 的解锁条目。")
+                self.log.info(f"已从 {st_lua_path} 移除 AppID {appid} 的解锁条目。")
         except Exception as e:
-            self.log.error(f"修改 steamtools.lua 以删除 AppID {appid} 时失败: {e}")
+            self.log.error(f"修改 {st_lua_path} 以删除 AppID {appid} 时失败: {e}")
             raise # 重新抛出异常，让上层捕获
-            
+
+    def _get_manager_dir(self, file_type: str) -> Path | None:
+        """返回入库管理器对应类型的目录。"""
+        if file_type == 'st':
+            return self.steam_path / 'config' / 'stplug-in'
+        elif file_type == 'gl':
+            return self.steam_path / 'AppList'
+        elif file_type == 'os':
+            return self.steam_path / OPENSTEAM_LUA_SUBDIR
+        return None
+
+    def get_file_content(self, file_type: str, filename: str) -> Dict:
+        """读取入库管理器中某个文件的文本内容（用于编辑器）。"""
+        directory = self._get_manager_dir(file_type)
+        if not directory:
+            return {"success": False, "message": f"未知的类型: {file_type}。"}
+        # 防路径穿越
+        name = Path(filename).name
+        file_path = directory / name
+        if not file_path.exists() or not file_path.is_file():
+            return {"success": False, "message": f"文件不存在: {name}"}
+        try:
+            content = file_path.read_text(encoding='utf-8', errors='ignore')
+            return {"success": True, "content": content, "filename": name}
+        except Exception as e:
+            return {"success": False, "message": f"读取文件失败: {e}"}
+
+    def save_file_content(self, file_type: str, filename: str, content: str) -> Dict:
+        """保存入库管理器中某个文件的文本内容（用于编辑器）。"""
+        directory = self._get_manager_dir(file_type)
+        if not directory:
+            return {"success": False, "message": f"未知的类型: {file_type}。"}
+        name = Path(filename).name
+        if not name or name.startswith('.') or '/' in name or '\\' in name:
+            return {"success": False, "message": "无效的文件名。"}
+        directory.mkdir(parents=True, exist_ok=True)
+        file_path = directory / name
+        try:
+            file_path.write_text(content, encoding='utf-8')
+            return {"success": True, "message": f"已保存 {name}。", "filename": name}
+        except Exception as e:
+            return {"success": False, "message": f"保存文件失败: {e}"}
+
+    async def force_unlock(self, appid: str, action: str = "add") -> Dict:
+        """在入库管理器中强制添加/移除某个 AppID 的解锁条目。
+
+        action='add'   -> 写入 <appid>.lua 并加入核心 lua（若存在）
+        action='remove'-> 删除 <appid>.lua 并从核心 lua 移除
+        """
+        if not appid or not appid.isdigit():
+            return {"success": False, "message": "无效的 AppID。"}
+        if action not in ("add", "remove"):
+            return {"success": False, "message": f"未知的操作: {action}。"}
+
+        # 每个请求都会新建 backend 实例，故这里按需初始化，确保 unlocker_type / steam_path 就绪
+        if not self.unlocker_type or not self.steam_path:
+            await self.initialize()
+        if not self.steam_path:
+            return {"success": False, "message": "Steam 路径未配置或无效。"}
+
+        lua_dir = self._lua_write_dir(self.unlocker_type or "steamtools")
+        lua_dir.mkdir(parents=True, exist_ok=True)
+        lua_file = lua_dir / f"{appid}.lua"
+
+        if action == "add":
+            # 主游戏 appid
+            lua_file.write_text(f'addappid({appid})\n', encoding='utf-8')
+            # 同时把 appid 加入核心 lua（若存在），保证 SteamTools/OpenSteam 都能识别
+            self._add_appid_to_core_lua(appid, lua_dir)
+            self.log.info(f"已强制解锁 AppID {appid} -> {lua_file}")
+            return {"success": True, "message": f"已强制解锁 AppID {appid}。"}
+        else:
+            removed_files = []
+            if lua_file.exists():
+                os.remove(lua_file)
+                removed_files.append(lua_file.name)
+            # 从核心 lua 中移除
+            try:
+                self._modify_st_lua_for_delete(appid, lua_dir=lua_dir)
+                removed_files.append("核心lua条目")
+            except Exception:
+                pass
+            self.log.info(f"已移除 AppID {appid} 的解锁 ({', '.join(removed_files) or '无文件'})")
+            return {"success": True, "message": f"已移除 AppID {appid} 的解锁。"}
+
+    def _add_appid_to_core_lua(self, appid: str, lua_dir: Path):
+        """把 appid 追加到核心 lua（steamtools.lua）中（若该文件存在）。"""
+        core_lua = lua_dir / "steamtools.lua"
+        if not core_lua.exists():
+            return
+        try:
+            content = core_lua.read_text(encoding='utf-8', errors='ignore')
+            if re.search(r'^\s*addappid\s*\(\s*' + re.escape(appid) + r'\s*\)\s*$', content, re.MULTILINE):
+                return
+            with open(core_lua, 'a', encoding='utf-8') as f:
+                f.write(f'addappid({appid})\n')
+            self.log.info(f"已将 AppID {appid} 追加到核心 lua。")
+        except Exception as e:
+            self.log.warning(f"追加 AppID {appid} 到核心 lua 失败: {e}")
+
     # --- END OF File Manager Methods ---
 
     # --- NEW: Custom repository support functions ---
@@ -649,8 +985,21 @@ class CaiBackend:
         return await self._process_zip_manifest_generic(app_id, download_url, f"自定义ZIP库 ({repo_name})", self.unlocker_type, False, add_all_dlc, patch_depot_key)
 
     def get_all_github_repos(self) -> List[str]:
-        """获取所有GitHub仓库（内置+自定义）"""
-        builtin_repos = ['Auiowu/ManifestAutoUpdate', 'SteamAutoCracks/ManifestHub']
+        """获取所有GitHub仓库（内置+自定义）
+
+        备注：`manilua-hub/ManifestHub3`、`steamtoolsapp/ManifestHub`、`ooiiuur/ManifestHubSharing`
+        实测与 `steamtools-games/ManifestHub3` 是同一数据库的克隆（同 appid 的 codeload zip
+        内容 sha256 一致，仅 zip 时间戳字节不同），不提供额外覆盖，故不列入避免无谓请求。
+        `dc190/ManifestHub` 分支数少（271）但与 ManifestHub3 有互补（如 2928600），保留。
+        """
+        builtin_repos = [
+            'Auiowu/ManifestAutoUpdate',
+            'SteamAutoCracks/ManifestHub',
+            # 6.2 万 appid 分支的超大清单库，覆盖 Auiowu 没有的冷门 / 新作 / 成人游戏
+            'steamtools-games/ManifestHub3',
+            # 271 分支的独立 fork，与上面的分支集合互补
+            'dc190/ManifestHub',
+        ]
         custom_repos = [repo['repo'] for repo in self.get_custom_github_repos()]
         return builtin_repos + custom_repos
 
@@ -892,42 +1241,6 @@ class CaiBackend:
         return None
 
 
-    async def _get_session_token(self) -> str | None:
-        """获取manifest.steam.run会话令牌"""
-        
-        backup_token = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
-        
-        try:
-            self.log.info("正在获取会话令牌...")
-            
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://manifest.steam.run/",
-                "Origin": "https://manifest.steam.run",
-                "Accept": "application/json, text/plain, */*",
-            }
-            
-            session_resp = await self.client.post(
-                "https://manifest.steam.run/api/session", 
-                headers=headers,
-                timeout=30
-            )
-            
-            if session_resp.status_code == 200:
-                data = session_resp.json()
-                if "token" in data:
-                    token = data["token"]
-                    self.log.info(f"成功获取会话令牌: ...{token[-6:]}")
-                    return token
-            
-            self.log.warning("会话令牌获取失败，使用备用令牌")
-            
-        except Exception as e:
-            self.log.warning(f"获取会话令牌时出错: {e}，使用备用令牌")
-        
-        return backup_token
-
-
     async def get_workshop_depot_info(self, workshop_id: str) -> Tuple[str, str, str] | None:
         """Get depot and manifest info for workshop item with title"""
         try:
@@ -995,87 +1308,43 @@ class CaiBackend:
         
         for attempt in range(max_retries):
             try:
-                # Step 1: 获取 session token
-                session_token = await self._get_session_token()
-                if not session_token:
-                    self.log.error("无法获取会话令牌")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(5)
-                        continue
-                    return None
-                
-                # Step 2: 请求下载代码
-                self.log.info(f"正在请求清单下载链接... [Depot: {depot_id}, Manifest: {manifest_id}]")
-                
-                request_payload = {
-                    "depot_id": str(depot_id),
-                    "manifest_id": str(manifest_id),
-                    "token": session_token
-                }
-                
+                # Step 1: 直接 GET 站点当前的下载端点（站点已改版，不再需要 session token
+                # 与 POST /api/request-code 换链接）。
+                self.log.info(f"正在请求清单: {output_filename} [Depot: {depot_id}, Manifest: {manifest_id}]")
+
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Referer": "https://manifest.steam.run/",
-                    "Origin": "https://manifest.steam.run",
-                    "Accept": "application/json, text/plain, */*",
-                    "Content-Type": "application/json"
+                    "Accept": "application/octet-stream, */*",
                 }
-                
+
                 # 等待避免频率限制
                 await asyncio.sleep(2)
-                
-                code_response = await self.client.post(
-                    "https://manifest.steam.run/api/request-code",
-                    json=request_payload,
+
+                manifest_response = await self.client.get(
+                    "https://manifest.steam.run/api/download_manifest",
+                    params={"depot_id": str(depot_id), "manifest_id": str(manifest_id)},
                     headers=headers,
-                    timeout=60
+                    timeout=180,
+                    follow_redirects=True,
                 )
-                
-                if code_response.status_code == 429:
+
+                if manifest_response.status_code == 429:
                     self.log.warning(f"请求频率过高，等待后重试...")
                     if attempt < max_retries - 1:
                         await asyncio.sleep(30)
                         continue
                     return None
-                
-                if code_response.status_code != 200:
-                    self.log.error(f"请求失败，状态码: {code_response.status_code}")
+
+                if manifest_response.status_code != 200:
+                    self.log.error(f"下载失败，状态码: {manifest_response.status_code}")
                     if attempt < max_retries - 1:
                         await asyncio.sleep(10)
                         continue
                     return None
-                
-                try:
-                    code_data = code_response.json()
-                except:
-                    self.log.error("服务器返回无效的JSON响应")
-                    if attempt < max_retries - 1:
-                        continue
-                    return None
-                
-                download_url = code_data.get("download_url")
-                if not download_url:
-                    error_msg = code_data.get('error', code_data.get('message', '未知错误'))
-                    self.log.error(f"请求下载链接失败: {error_msg}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(15)
-                        continue
-                    return None
-                
-                self.log.info(f"获取到下载链接")
-                
-                # Step 3: 下载清单文件
-                self.log.info("正在下载清单文件...")
-                manifest_response = await self.client.get(download_url, timeout=180)
-                
-                if manifest_response.status_code != 200:
-                    self.log.error(f"下载失败，状态码: {manifest_response.status_code}")
-                    if attempt < max_retries - 1:
-                        continue
-                    return None
-                
+
                 manifest_content = manifest_response.content
-                
+
                 # Step 4: 处理文件内容（检查是否为ZIP）
                 final_content = None
                 
@@ -1174,38 +1443,6 @@ class CaiBackend:
             self.log.error(f"保存创意工坊清单文件时出错: {self.stack_error(e)}")
             return False
 
-    async def _get_buqiuren_session_token(self) -> str | None:
-        """获取不求人接口的会话令牌"""
-        backup_token = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
-        
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://manifest.steam.run/",
-                "Origin": "https://manifest.steam.run",
-                "Accept": "application/json, text/plain, */*",
-            }
-            
-            session_resp = await self.client.post(
-                "https://manifest.steam.run/api/session", 
-                headers=headers,
-                timeout=30
-            )
-            
-            if session_resp.status_code == 200:
-                data = session_resp.json()
-                if "token" in data:
-                    token = data["token"]
-                    self.log.info(f"成功获取不求人会话令牌: ...{token[-6:]}")
-                    return token
-            
-            self.log.warning("使用备用令牌")
-            
-        except Exception as e:
-            self.log.warning(f"获取不求人会话令牌时出错: {e}")
-        
-        return backup_token
-
     async def _download_manifest_buqiuren(self, depot_id: str, manifest_id: str, depot_name: str) -> bool:
         """使用不求人接口下载清单"""
         output_filename = f"{depot_id}_{manifest_id}.manifest"
@@ -1213,85 +1450,41 @@ class CaiBackend:
         
         for attempt in range(max_retries):
             try:
-                # 获取session token
-                session_token = await self._get_buqiuren_session_token()
-                if not session_token:
-                    self.log.error("无法获取会话令牌")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(5)
-                        continue
-                    return False
-                
-                # 请求下载链接
-                self.log.info(f"正在请求清单下载链接... [Depot: {depot_id}, Manifest: {manifest_id}]")
-                
-                request_payload = {
-                    "depot_id": str(depot_id),
-                    "manifest_id": str(manifest_id),
-                    "token": session_token
-                }
-                
+                # 站点已改版：不再需要 session token，也不再走 POST /api/request-code 换下载链接，
+                # 直接 GET /api/download_manifest?depot_id=..&manifest_id=.. 就返回 raw manifest。
+                self.log.info(f"正在请求清单: {output_filename} [Depot: {depot_id}, Manifest: {manifest_id}]")
+
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Referer": "https://manifest.steam.run/",
-                    "Origin": "https://manifest.steam.run",
-                    "Accept": "application/json, text/plain, */*",
-                    "Content-Type": "application/json"
+                    "Accept": "application/octet-stream, */*",
                 }
-                
-                # 等待避免频率限制
-                await asyncio.sleep(random.uniform(2, 5))
-                
-                code_response = await self.client.post(
-                    "https://manifest.steam.run/api/request-code",
-                    json=request_payload,
+
+                # 轻微随机间隔，避免触发站点限流
+                await asyncio.sleep(random.uniform(1, 3))
+
+                manifest_response = await self.client.get(
+                    "https://manifest.steam.run/api/download_manifest",
+                    params={"depot_id": str(depot_id), "manifest_id": str(manifest_id)},
                     headers=headers,
-                    timeout=60
+                    timeout=180,
+                    follow_redirects=True,
                 )
-                
-                if code_response.status_code == 429:
-                    self.log.warning(f"请求频率过高，等待后重试...")
+
+                if manifest_response.status_code == 429:
+                    self.log.warning("请求频率过高，等待后重试...")
                     if attempt < max_retries - 1:
                         await asyncio.sleep(30)
                         continue
                     return False
-                
-                if code_response.status_code != 200:
-                    self.log.error(f"请求失败，状态码: {code_response.status_code}")
+
+                if manifest_response.status_code != 200:
+                    self.log.error(f"下载失败，状态码: {manifest_response.status_code}")
                     if attempt < max_retries - 1:
                         await asyncio.sleep(10)
                         continue
                     return False
-                
-                try:
-                    code_data = code_response.json()
-                except:
-                    self.log.error("服务器返回无效的JSON响应")
-                    if attempt < max_retries - 1:
-                        continue
-                    return False
-                
-                download_url = code_data.get("download_url")
-                if not download_url:
-                    error_msg = code_data.get('error', code_data.get('message', '未知错误'))
-                    self.log.error(f"请求下载链接失败: {error_msg}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(15)
-                        continue
-                    return False
-                
-                self.log.info(f"获取到下载链接")
-                
-                # 下载清单文件
-                self.log.info("正在下载清单文件...")
-                manifest_response = await self.client.get(download_url, timeout=180)
-                
-                if manifest_response.status_code != 200:
-                    self.log.error(f"下载失败，状态码: {manifest_response.status_code}")
-                    if attempt < max_retries - 1:
-                        continue
-                    return False
-                
+
                 manifest_content = manifest_response.content
                 
                 # 处理文件内容（检查是否为ZIP）
@@ -1323,7 +1516,7 @@ class CaiBackend:
                     return False
                 
                 # 保存文件到depotcache目录
-                if self.unlocker_type == "steamtools":
+                if self._is_lua_unlocker(self.unlocker_type):
                     st_depot_path = self.steam_path / 'config' / 'depotcache'
                     gl_depot_path = self.steam_path / 'depotcache'
                     
@@ -1380,33 +1573,33 @@ class CaiBackend:
             except Exception as e:
                 self.log.warning(f"读取本地缓存失败，将重新下载: {e}")
 
-        # 2. 下载新数据
-        url = "https://api.993499094.xyz/depotkeys.json"
-        try:
-            self.log.info(f"正在从 Sudama API ({url}) 下载全量密钥库...")
-            # 数据量可能较大，使用较大的超时
-            response = await self.client.get(url, timeout=120)
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            if not isinstance(data, dict):
-                self.log.error("API 返回的数据格式不正确 (应为 JSON 对象)")
-                return {}
+        # 2. 下载新数据（按顺序尝试多个可用数据源，任一成功即用）
+        candidate_urls = [
+            ("Sudama API", "https://api.993499094.xyz/depotkeys.json"),
+            # SteamAutoCracks/ManifestHub 的 depotkeys.json：纯 raw 通道，不消耗 GitHub API 配额，
+            # 28 万条 depot 密钥，是 Sudama 的主备源。
+            ("SteamAutoCracks/ManifestHub", "https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json"),
+        ]
+        data = None
+        used_source = None
+        for src_name, url in candidate_urls:
+            try:
+                self.log.info(f"正在从 {src_name} 下载全量密钥库...")
+                # 数据量较大，使用较大的超时
+                response = await self.client.get(url, timeout=180)
+                response.raise_for_status()
+                parsed = response.json()
+                if not isinstance(parsed, dict) or not parsed:
+                    self.log.warning(f"{src_name} 返回的数据格式不正确或为空，尝试下一个数据源。")
+                    continue
+                data = parsed
+                used_source = src_name
+                break
+            except Exception as e:
+                self.log.warning(f"从 {src_name} 下载密钥库失败: {type(e).__name__}: {e}")
 
-            # 3. 写入缓存
-            cache_data = {
-                "timestamp": current_time,
-                "data": data
-            }
-            async with aiofiles.open(cache_file, 'w', encoding='utf-8') as f:
-                await f.write(json.dumps(cache_data, ensure_ascii=False))
-            
-            self.log.info(f"密钥库下载完成并缓存，共 {len(data)} 条数据。")
-            return data
-
-        except Exception as e:
-            self.log.error(f"下载 Sudama 数据失败: {self.stack_error(e)}")
+        if data is None:
+            self.log.error("所有密钥库数据源均下载失败。")
             # 下载失败时的兜底：如果有过期的缓存，尽量使用过期的
             if cache_file.exists():
                 try:
@@ -1416,6 +1609,19 @@ class CaiBackend:
                 except:
                     pass
             return {}
+
+        # 3. 写入缓存
+        try:
+            cache_data = {
+                "timestamp": current_time,
+                "data": data
+            }
+            async with aiofiles.open(cache_file, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(cache_data, ensure_ascii=False))
+            self.log.info(f"密钥库下载完成并缓存（来源: {used_source}），共 {len(data)} 条数据。")
+        except Exception as e:
+            self.log.warning(f"写入密钥库缓存失败（不影响本次使用）: {e}")
+        return data
 
 
 # --- SUDAMA REPO START ---
@@ -1458,10 +1664,10 @@ class CaiBackend:
                 return False
 
             # 4. 根据解锁工具类型处理 (复用 ManifestHub V2 的逻辑)
-            if unlocker_type == "steamtools":
+            if self._is_lua_unlocker(unlocker_type):
                 # 将 sudama_keys 作为 depotkeys_data 传入，以便复用修补逻辑
                 return await self._process_steamautocracks_v2_for_steamtools(
-                    app_id, valid_depots, depot_manifest_map, use_st_auto_update, add_all_dlc, patch_depot_key, sudama_keys
+                    app_id, valid_depots, depot_manifest_map, use_st_auto_update, add_all_dlc, patch_depot_key, sudama_keys, unlocker_type
                 )
             else:
                 return await self._process_steamautocracks_v2_for_greenluma(app_id, valid_depots)
@@ -1471,18 +1677,23 @@ class CaiBackend:
             return False
             
             
-    async def process_buqiuren_manifest(self, app_id: str) -> bool:
-        """处理不求人库清单下载"""
+    async def process_buqiuren_manifest(self, app_id: str, unlocker_type: str = "", use_st_auto_update: bool = False, add_all_dlc: bool = False, patch_depot_key: bool = False) -> bool:
+        """处理不求人库清单下载
+
+        对 Lua 类解锁器（SteamTools / OpenSteam），除了把 .manifest 落进 depotcache，
+        还要生成 lua 解锁文件（addappid + addappid(depot,1,key) + setManifestid），
+        否则 OpenSteam 只会看到一堆清单文件而不会真正解锁。
+        """
         try:
             self.log.info(f'正从 清单不求人库 处理 AppID {app_id} 的清单...')
             
             # 使用steamui API获取depot和manifest信息（复用现有逻辑）
             depot_manifest_map = await self._get_depots_and_manifests_from_steamui(app_id)
             if not depot_manifest_map:
-                self.log.error(f"未能从 steamui API 获取到 AppID {app_id} 的 depot 信息，请检查APP ID是否正确或API请求问题")
+                self.log.error(f"未能获取到 AppID {app_id} 的 depot 信息（已尝试 steamui / ddxnb / steamcmd 三个数据源），请检查APP ID是否正确。")
                 return False
             
-            self.log.info(f"从 steamui API 获取到 {len(depot_manifest_map)} 个 depot 及其 manifest")
+            self.log.info(f"已获取 AppID {app_id} 的 {len(depot_manifest_map)} 个 depot 及其 manifest")
             
             # 下载所有depot的清单
             success_count = 0
@@ -1500,7 +1711,7 @@ class CaiBackend:
                 
                 # 添加延迟避免频率限制
                 if i < total_count:
-                    delay = random.uniform(10, 20)
+                    delay = random.uniform(2, 4)
                     self.log.info(f"等待 {delay:.1f} 秒后继续...")
                     await asyncio.sleep(delay)
             
@@ -1509,11 +1720,61 @@ class CaiBackend:
                 return False
             
             self.log.info(f"成功处理不求人库清单: 成功 {success_count}/{total_count}")
+
+            # 为 Lua 类解锁器生成 lua 解锁文件
+            effective_unlocker = unlocker_type or self.unlocker_type or ""
+            if self._is_lua_unlocker(effective_unlocker):
+                await self._generate_lua_from_buqiuren(
+                    app_id, depot_manifest_map, effective_unlocker,
+                    use_st_auto_update, add_all_dlc, patch_depot_key
+                )
             return True
             
         except Exception as e:
             self.log.error(f'处理不求人库清单时出错: {self.stack_error(e)}')
             return False
+
+    async def _generate_lua_from_buqiuren(self, app_id: str, depot_manifest_map: Dict[str, str], unlocker_type: str, use_st_auto_update: bool, add_all_dlc: bool, patch_depot_key: bool) -> None:
+        """根据不求人库的 depot->manifest 映射生成 lua 解锁文件（尽量补上 depotkey）。"""
+        try:
+            # 尝试补全 depotkey（拿不到也不影响 setManifestid 生效）
+            depotkeys_data = {}
+            try:
+                depotkeys_data = await self._get_cached_sudama_data() or {}
+            except Exception as e:
+                self.log.warning(f"获取 depotkey 失败（将继续生成不含密钥的 lua）: {e}")
+
+            lua_dir = self._lua_write_dir(unlocker_type)
+            lua_dir.mkdir(parents=True, exist_ok=True)
+            lua_filepath = lua_dir / f"{app_id}.lua"
+
+            tool_label = "OpenSteam" if unlocker_type == "opensteam" else "SteamTools"
+            self.log.info(f"{tool_label} 自动更新模式: {'已启用' if use_st_auto_update else '已禁用'}")
+
+            matched_keys = 0
+            async with aiofiles.open(lua_filepath, mode="w", encoding="utf-8") as lua_file:
+                await lua_file.write(f'addappid({app_id})\n')
+
+                for depot_id in depot_manifest_map.keys():
+                    key = depotkeys_data.get(str(depot_id))
+                    if key and str(key).strip():
+                        await lua_file.write(f'addappid({depot_id}, 1, "{str(key).strip()}")\n')
+                        matched_keys += 1
+
+                for depot_id, manifest_id in depot_manifest_map.items():
+                    line = f'setManifestid({depot_id}, "{manifest_id}")\n'
+                    await lua_file.write('--' + line if use_st_auto_update else line)
+
+            self.log.info(f"已为{tool_label}生成解锁文件: {lua_filepath}（匹配到 {matched_keys}/{len(depot_manifest_map)} 个 depotkey）")
+
+            if add_all_dlc:
+                await self._add_free_dlcs_to_lua(app_id, lua_filepath)
+
+            if patch_depot_key:
+                self.log.info("开始修补创意工坊depotkey...")
+                await self.patch_lua_with_depotkey(app_id, lua_filepath)
+        except Exception as e:
+            self.log.error(f"为不求人库生成 lua 时出错: {self.stack_error(e)}")
 
     # NEW: DepotKey patching methods
     async def download_depotkeys_json(self) -> Dict | None:
@@ -1533,10 +1794,10 @@ class CaiBackend:
             # 1. 从 steamui API 获取 depot 和 manifest 信息
             depot_manifest_map = await self._get_depots_and_manifests_from_steamui(app_id)
             if not depot_manifest_map:
-                self.log.error(f"未能从 steamui API 获取到 AppID {app_id} 的 depot 信息，请检查APP ID是否正确或API请求问题")
+                self.log.error(f"未能获取到 AppID {app_id} 的 depot 信息（已尝试 steamui / ddxnb / steamcmd 三个数据源），请检查APP ID是否正确。")
                 return False
             
-            self.log.info(f"从 steamui API 获取到 {len(depot_manifest_map)} 个 depot 及其 manifest")
+            self.log.info(f"已获取 AppID {app_id} 的 {len(depot_manifest_map)} 个 depot 及其 manifest")
             
             # 2. 下载 depotkeys.json（复用现有方法）
             if 'IS_CN' not in os.environ:
@@ -1567,8 +1828,8 @@ class CaiBackend:
                 return False
             
             # 4. 根据解锁工具类型处理
-            if unlocker_type == "steamtools":
-                return await self._process_steamautocracks_v2_for_steamtools(app_id, valid_depots, depot_manifest_map, use_st_auto_update, add_all_dlc, patch_depot_key, depotkeys_data)
+            if self._is_lua_unlocker(unlocker_type):
+                return await self._process_steamautocracks_v2_for_steamtools(app_id, valid_depots, depot_manifest_map, use_st_auto_update, add_all_dlc, patch_depot_key, depotkeys_data, unlocker_type)
             else:
                 return await self._process_steamautocracks_v2_for_greenluma(app_id, valid_depots)
                 
@@ -1691,14 +1952,57 @@ class CaiBackend:
             if vdf_content:
                 self.log.warning(f"主API返回内容预览: {vdf_content[:300]}...")
             self.log.info("正在尝试备用API (steam.ddxnb.cn)...")
-        
-        # 2. 如果主API失败，调用备用API
-        return await self._get_depots_and_manifests_from_ddxnb(app_id)
 
-    async def _process_steamautocracks_v2_for_steamtools(self, app_id: str, valid_depots: Dict[str, str], depot_manifest_map: Dict[str, str], use_st_auto_update: bool, add_all_dlc: bool, patch_depot_key: bool, depotkeys_data: Dict) -> bool:
-        """为 SteamTools 处理 SteamAutoCracks/ManifestHub(2) 清单"""
+        # 2. 如果主API失败，调用备用API
+        depot_manifest_map = await self._get_depots_and_manifests_from_ddxnb(app_id)
+        if depot_manifest_map:
+            return depot_manifest_map
+
+        # 3. 备用API 也失败时，降级到 SteamCMD API（结构与 ddxnb 一致）
+        self.log.info("正在尝试 SteamCMD API (api.steamcmd.net)...")
+        return await self._get_depots_and_manifests_from_steamcmd(app_id)
+
+    async def _get_depots_and_manifests_from_steamcmd(self, app_id: str) -> Dict[str, str]:
+        """从 SteamCMD API (api.steamcmd.net) 获取 depot 和对应的 manifest 信息。
+        该接口返回 {"status":"success","data":{"<appid>":{"depots":{...}}}}，结构与 ddxnb 一致。"""
         try:
-            stplug_path = self.steam_path / 'config' / 'stplug-in'
+            url = f"https://api.steamcmd.net/v1/info/{app_id}"
+            data = await self.http_get_safe(url, timeout=25, max_retries=3, retry_delay=2.0)
+            if data is None:
+                self.log.warning("SteamCMD API 无响应，跳过。")
+                return {}
+
+            payload = data.json()
+            if payload.get("status") != "success":
+                self.log.warning(f"SteamCMD API 返回状态异常: {payload.get('status')}")
+                return {}
+
+            app_data = (payload.get("data") or {}).get(str(app_id)) or {}
+            depots = app_data.get("depots") or {}
+            depot_manifest_map = {}
+            for depot_id, depot_info in depots.items():
+                if not str(depot_id).isdigit() or not isinstance(depot_info, dict):
+                    continue
+                public_manifest = (depot_info.get("manifests") or {}).get("public") or {}
+                manifest_id = public_manifest.get("gid")
+                if manifest_id:
+                    depot_manifest_map[str(depot_id)] = str(manifest_id)
+
+            if depot_manifest_map:
+                self.log.info(f"从 SteamCMD API 成功获取 {len(depot_manifest_map)} 个 depot。")
+            else:
+                self.log.warning(f"SteamCMD API 未找到 AppID {app_id} 的任何有效 depot-manifest 映射。")
+            return depot_manifest_map
+
+        except Exception as e:
+            self.log.error(f"从 SteamCMD API 获取 depot 信息失败: {e}")
+            return {}
+
+    async def _process_steamautocracks_v2_for_steamtools(self, app_id: str, valid_depots: Dict[str, str], depot_manifest_map: Dict[str, str], use_st_auto_update: bool, add_all_dlc: bool, patch_depot_key: bool, depotkeys_data: Dict, unlocker_type: str = "steamtools") -> bool:
+        """为 SteamTools / OpenSteam 处理 SteamAutoCracks/ManifestHub(2) 清单"""
+        try:
+            stplug_path = self._lua_write_dir(unlocker_type)
+            stplug_path.mkdir(parents=True, exist_ok=True)
             
             lua_filename = f"{app_id}.lua"
             lua_filepath = stplug_path / lua_filename
@@ -1738,7 +2042,8 @@ class CaiBackend:
                     await lua_file.write('\n-- Manifests\n')
                     await lua_file.write('\n'.join(manifest_lines) + '\n')
             
-            self.log.info(f"已为SteamTools生成解锁文件: {lua_filename}")
+            tool_label = "OpenSteam" if unlocker_type == "opensteam" else "SteamTools"
+            self.log.info(f"已为{tool_label}生成解锁文件: {lua_filepath}")
             
             # 处理 DLC
             if add_all_dlc:
@@ -1923,11 +2228,28 @@ class CaiBackend:
             if result.returncode == 0: self.log.info("成功关闭 Steam 进程。")
             elif result.returncode == 128: self.log.info("未找到正在运行的 Steam 进程，将直接启动。")
             else: self.log.warning(f"关闭 Steam 时遇到问题 (返回码: {result.returncode})。错误信息: {result.stderr.strip()}")
+
+            # 若当前使用 OpenSteam(OpenSteamKitten)，先关闭旧实例，重启 Steam 后再拉起
+            opensteam_exe = self._get_opensteam_exe_path()
+            if opensteam_exe is not None:
+                self.log.info("检测到 OpenSteamKitten，正在关闭旧实例...")
+                subprocess.run(["taskkill", "/F", "/IM", OPENSTEAM_EXE_NAME], capture_output=True, text=True, check=False)
+
             self.log.info("等待 3 秒以确保 Steam 完全关闭...")
             time.sleep(3)
             self.log.info(f"正在尝试从 '{steam_exe_path}' 启动 Steam...")
             subprocess.Popen([str(steam_exe_path)], creationflags=subprocess.DETACHED_PROCESS, close_fds=True)
             self.log.info("已发送重启 Steam 的指令。")
+
+            if opensteam_exe is not None:
+                # Steam 启动后再拉起 OpenSteamKitten，避免与关闭中的进程争用
+                time.sleep(2)
+                self.log.info(f"正在启动 OpenSteamKitten: '{opensteam_exe}'...")
+                try:
+                    subprocess.Popen([str(opensteam_exe)], creationflags=subprocess.DETACHED_PROCESS, close_fds=True)
+                    self.log.info("已发送启动 OpenSteamKitten 的指令。")
+                except Exception as e:
+                    self.log.warning(f"启动 OpenSteamKitten 失败: {e}")
             return True
         except Exception as e:
             self.log.error(f"重启 Steam 失败: {self.stack_error(e)}")
@@ -1940,7 +2262,7 @@ class CaiBackend:
         else: self.log.warning("未找到GitHub Token。您的API请求将受到严格的速率限制。")
         url = 'https://api.github.com/rate_limit'
         try:
-            r = await self.client.get(url, headers=headers)
+            r = await self.client.get(url, headers=headers, timeout=15)
             r.raise_for_status()
             rate_limit = r.json().get('resources', {}).get('core', {})
             remaining = rate_limit.get('remaining', 0)
@@ -1953,8 +2275,10 @@ class CaiBackend:
                 return False
             return True
         except Exception as e:
-            self.log.error(f'检查GitHub API速率限制失败: {self.stack_error(e)}')
-            return False
+            # 只是探测配额失败（网络不可达/被墙），不代表配额用尽；
+            # 直接放行，让后续实际请求自己报错，避免整条任务链被卡住。
+            self.log.warning(f"无法查询 GitHub API 速率限制（网络不可达？），跳过配额检查继续: {type(e).__name__}")
+            return True
 
     async def checkcn(self) -> bool:
         try:
@@ -2127,6 +2451,16 @@ class CaiBackend:
             response = await self.client.get(download_url, timeout=60)
             response.raise_for_status()
             async with aiofiles.open(zip_path, 'wb') as f: await f.write(response.content)
+            # 校验下载内容真的是 zip：部分镜像会返回 "OK"/HTML 错误页，直接用 zipfile 打开只会抛 BadZipFile
+            if not zipfile.is_zipfile(zip_path):
+                preview = response.content[:120]
+                try:
+                    preview_text = preview.decode('utf-8', errors='ignore').strip()
+                except Exception:
+                    preview_text = repr(preview)
+                self.log.error(f'{source_name} 返回的内容不是有效的 zip（{len(response.content)} 字节，开头: {preview_text[:100]!r}）。'
+                               f'该源可能已失效或不提供此 AppID，请换用其他清单源。')
+                return False
             self.log.info('正在解压...')
             with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(extract_path)
             
@@ -2143,9 +2477,11 @@ class CaiBackend:
             manifest_files = list(extract_path.glob('*.manifest'))
             lua_files = list(extract_path.glob('*.lua'))
             
-            if unlocker_type == "steamtools":
-                self.log.info(f"SteamTools 自动更新模式: {'已启用' if use_st_auto_update else '已禁用'}")
-                stplug_path = self.steam_path / 'config' / 'stplug-in'
+            if self._is_lua_unlocker(unlocker_type):
+                tool_label = "OpenSteam" if unlocker_type == "opensteam" else "SteamTools"
+                self.log.info(f"{tool_label} 自动更新模式: {'已启用' if use_st_auto_update else '已禁用'}")
+                stplug_path = self._lua_write_dir(unlocker_type)
+                stplug_path.mkdir(parents=True, exist_ok=True)
                 
                 all_depots = {}
                 for lua_f in lua_files:
@@ -2165,7 +2501,8 @@ class CaiBackend:
                             line = f'setManifestid({match.group(1)}, "{match.group(2)}")\n'
                             if use_st_auto_update: await lua_file.write('--' + line)
                             else: await lua_file.write(line)
-                self.log.info(f"已为 SteamTools 生成解锁文件: {lua_filename}")
+                tool_label = "OpenSteam" if unlocker_type == "opensteam" else "SteamTools"
+                self.log.info(f"已为 {tool_label} 生成解锁文件: {lua_filepath}")
 
                 if add_all_dlc:
                     await self._add_free_dlcs_to_lua(app_id, lua_filepath)
@@ -2202,6 +2539,140 @@ class CaiBackend:
             if zip_path.exists(): zip_path.unlink(missing_ok=True)
             if extract_path.exists(): shutil.rmtree(extract_path)
 
+    async def process_steamtools_games_manifest(self, app_id: str, unlocker_type: str, use_st_auto_update: bool, add_all_dlc: bool = False, patch_depot_key: bool = False) -> bool:
+        """从 steamtools.games 公开 API 获取清单与 lua。
+
+        该站对外提供无需 key 的 REST 接口（2026-11 实测可用）：
+          POST /api/generate  {"appId": "<appid>"}  -> 返回 luaUrl / keyVdfUrl / downloadUrl
+          GET  /api/files/{appid}/lua               -> 直接拿到成品 lua
+          GET  /api/files/{appid}/key               -> key.vdf（depots.<depot>.DecryptionKey）
+          GET  /api/files/{appid}/zip               -> <appid>_public.lua + key.vdf + README.txt
+        它的清单库是 6 万+ appid 分支的 ManifestHub3，比 Auiowu 覆盖广得多，
+        冷门 / 新作命中率明显更高。
+        """
+        try:
+            self.log.info(f'正从 steamtools.games 处理 AppID {app_id} 的清单...')
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://steamtools.games/",
+            }
+
+            # 1. 查询覆盖情况与游戏名
+            resp = await self.client.post(
+                "https://steamtools.games/api/generate",
+                json={"appId": str(app_id)},
+                headers=headers,
+                timeout=60,
+                follow_redirects=True,
+            )
+            if resp.status_code == 429:
+                self.log.warning("steamtools.games 请求过于频繁 (429)，请稍后再试。")
+                return False
+            if resp.status_code != 200:
+                self.log.error(f"steamtools.games 返回 HTTP{resp.status_code}。")
+                return False
+
+            payload = resp.json()
+            if payload.get("code") != 0:
+                self.log.warning(f"steamtools.games: {payload.get('message', '未收录该 AppID')}")
+                return False
+
+            info = payload.get("data") or {}
+            game_name = info.get("gameName") or ""
+            if game_name:
+                self.log.info(f"steamtools.games 命中: {game_name}")
+
+            # 2. 直接取成品 lua（站方已按 ManifestHub3 的 depot/manifest 生成好）
+            lua_resp = await self.client.get(
+                f"https://steamtools.games/api/files/{app_id}/lua",
+                headers=headers, timeout=90, follow_redirects=True,
+            )
+            if lua_resp.status_code != 200 or not lua_resp.text.strip():
+                self.log.error(f"steamtools.games 未返回有效 lua（HTTP{lua_resp.status_code}）。")
+                return False
+
+            lua_text = lua_resp.text
+            self.log.info(f"已获取 lua 内容（{len(lua_text)} 字节）。")
+
+            # 3. 取 key.vdf 补全 depotkey（lua 里已有的不重复加）
+            depot_keys = {}
+            try:
+                key_resp = await self.client.get(
+                    f"https://steamtools.games/api/files/{app_id}/key",
+                    headers=headers, timeout=60, follow_redirects=True,
+                )
+                if key_resp.status_code == 200 and key_resp.text.strip():
+                    parsed = vdf.loads(key_resp.text)
+                    for depot_id, depot_info in (parsed.get("depots") or {}).items():
+                        if isinstance(depot_info, dict) and depot_info.get("DecryptionKey"):
+                            depot_keys[str(depot_id)] = str(depot_info["DecryptionKey"])
+                    self.log.info(f"key.vdf 提供 {len(depot_keys)} 个 depotkey。")
+            except Exception as e:
+                self.log.warning(f"读取 key.vdf 失败（不影响主要流程）: {e}")
+
+            # 4. 写入
+            if self._is_lua_unlocker(unlocker_type):
+                lua_dir = self._lua_write_dir(unlocker_type)
+                lua_dir.mkdir(parents=True, exist_ok=True)
+                lua_filepath = lua_dir / f"{app_id}.lua"
+
+                lines = [lua_text.rstrip("\n")]
+                existing = set(re.findall(r'addappid\(\s*(\d+)\s*,', lua_text))
+                for depot_id, key in depot_keys.items():
+                    if depot_id not in existing and depot_id != str(app_id):
+                        lines.append(f'addappid({depot_id}, 1, "{key}")')
+
+                content = "\n".join(lines) + "\n"
+
+                async with aiofiles.open(lua_filepath, mode="w", encoding="utf-8") as f:
+                    await f.write(content)
+
+                tool_label = "OpenSteam" if unlocker_type == "opensteam" else "SteamTools"
+                self.log.info(f"已为{tool_label}生成解锁文件: {lua_filepath}")
+
+                if add_all_dlc:
+                    await self._add_free_dlcs_to_lua(app_id, lua_filepath)
+                if patch_depot_key:
+                    self.log.info("开始修补创意工坊depotkey...")
+                    await self.patch_lua_with_depotkey(app_id, lua_filepath)
+            else:
+                # GreenLuma：把 zip 里的 .manifest 落进 depotcache
+                zip_resp = await self.client.get(
+                    f"https://steamtools.games/api/files/{app_id}/zip",
+                    headers=headers, timeout=180, follow_redirects=True,
+                )
+                if zip_resp.status_code != 200 or not zipfile.is_zipfile(io.BytesIO(zip_resp.content)):
+                    self.log.error("steamtools.games 未返回有效 zip，GreenLuma 模式无法继续。")
+                    return False
+
+                depot_cache_path = self.steam_path / 'depotcache'
+                depot_cache_path.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+                    saved = 0
+                    for name in zf.namelist():
+                        if name.lower().endswith('.manifest'):
+                            (depot_cache_path / Path(name).name).write_bytes(zf.read(name))
+                            self.log.info(f"已为 GreenLuma 保存清单: {Path(name).name}")
+                            saved += 1
+                if not saved:
+                    self.log.error("zip 中没有 .manifest 文件。")
+                    return False
+
+                if depot_keys:
+                    await self.depotkey_merge(
+                        self.steam_path / 'config' / 'config.vdf',
+                        {'depots': {d: {"DecryptionKey": k} for d, k in depot_keys.items()}},
+                    )
+                    ids = list(depot_keys.keys()) + [str(app_id)]
+                    await self.greenluma_add(list(set(ids)))
+                    self.log.info("已合并密钥并添加到GreenLuma。")
+
+            return True
+
+        except Exception as e:
+            self.log.error(f"处理 steamtools.games 清单时出错: {self.stack_error(e)}")
+            return False
+
     async def process_zip_source(self, app_id: str, tool_type: str, unlocker_type: str, use_st_auto_update: bool, add_all_dlc: bool, patch_depot_key: bool = False) -> bool:
         source_map = {
             "printedwaste": "https://api.printedwaste.com/gfk/download/{app_id}",
@@ -2211,6 +2682,7 @@ class CaiBackend:
             "steamdatabase": "https://steamdatabase.s3.eu-north-1.amazonaws.com/{app_id}.zip",
             "steamautocracks_v2": "special",  # 特殊处理标识
             "buqiuren": "special",
+            "steamtools_games": "special",
             "sudama": "special"
         }
         source_name_map = { 
@@ -2226,7 +2698,10 @@ class CaiBackend:
         if tool_type == "steamautocracks_v2":
             return await self.process_steamautocracks_v2_manifest(app_id, unlocker_type, use_st_auto_update, add_all_dlc, patch_depot_key)
         if tool_type == "buqiuren":
-            return await self.process_buqiuren_manifest(app_id)
+            return await self.process_buqiuren_manifest(app_id, unlocker_type, use_st_auto_update, add_all_dlc, patch_depot_key)
+
+        if tool_type == "steamtools_games":
+            return await self.process_steamtools_games_manifest(app_id, unlocker_type, use_st_auto_update, add_all_dlc, patch_depot_key)
             
         if tool_type == "sudama":
             return await self.process_sudama_manifest(app_id, unlocker_type, use_st_auto_update, add_all_dlc, patch_depot_key)
@@ -2283,6 +2758,137 @@ class CaiBackend:
         return None
 
     # MODIFIED: Added patch_depot_key parameter
+    async def _process_github_repo_via_codeload(self, app_id: str, repo: str, unlocker_type: str, use_st_auto_update: bool, add_all_dlc: bool, patch_depot_key: bool = False) -> bool:
+        """通过 codeload 分支 zip 处理 GitHub 清单仓库（不消耗 GitHub API 配额）。
+
+        `https://codeload.github.com/{repo}/zip/refs/heads/{appid}` 直接把整个分支打成 zip，
+        内含 Key.vdf / config.json / *.manifest，与 API + raw 逐文件下载等价，但不计入
+        api.github.com 的 60 次/小时匿名配额，也不会因配额耗尽而中断。
+        """
+        import io as _io
+        codeload_url = f"https://codeload.github.com/{repo}/zip/refs/heads/{app_id}"
+        try:
+            self.log.info(f"正在通过 codeload 拉取 {repo} 分支 {app_id} ...")
+            resp = await self.client.get(codeload_url, timeout=180, follow_redirects=True)
+            if resp.status_code != 200:
+                self.log.error(f"codeload 拉取失败: HTTP{resp.status_code}。如果该清单在 {repo} 中不存在分支 {app_id}，这是正常现象。")
+                return False
+
+            if not zipfile.is_zipfile(_io.BytesIO(resp.content)):
+                self.log.error(f"codeload 返回的内容不是有效的 zip（{len(resp.content)} 字节），该分支可能不存在。")
+                return False
+
+            zf = zipfile.ZipFile(_io.BytesIO(resp.content))
+            names = zf.namelist()
+
+            all_manifest_paths_in_tree = [n for n in names if n.lower().endswith('.manifest')]
+            key_vdf_path = next((n for n in names if n.lower().endswith('key.vdf')), None)
+
+            all_depots = {}
+            if key_vdf_path:
+                try:
+                    all_depots = vdf.loads(zf.read(key_vdf_path).decode('utf-8')).get('depots', {})
+                except Exception as e:
+                    self.log.error(f"解析 key.vdf 失败: {e}")
+
+            # 额外信息：config.json 里的 DLC 列表，用于日志提示
+            config_path = next((n for n in names if n.endswith('config.json')), None)
+            if config_path:
+                try:
+                    meta = json.loads(zf.read(config_path).decode('utf-8'))
+                    if meta.get('dlcs'):
+                        self.log.info(f"该 AppID 在仓库中登记的 DLC: {meta.get('dlcs')}")
+                except Exception:
+                    pass
+
+            if self._is_lua_unlocker(unlocker_type):
+                self.log.info(f"{'OpenSteam' if unlocker_type == 'opensteam' else 'SteamTools'} 自动更新模式: {'已启用' if use_st_auto_update else '已禁用'}")
+                lua_dir = self._lua_write_dir(unlocker_type)
+                lua_dir.mkdir(parents=True, exist_ok=True)
+                lua_filepath = lua_dir / f"{app_id}.lua"
+
+                # 部分清单库（如 dc190/ManifestHub）分支里不带 key.vdf，只有一份现成的
+                # <appid>.lua，其中 addappid(depot) 行没有密钥。这种情况下 depot 列表仍以
+                # zip 内的 lua 为准，密钥再去密钥库里补，避免生成缺 key 的无效解锁文件。
+                depot_ids_from_lua = []
+                lua_in_zip = next((n for n in names if n.lower().endswith(f'{app_id}.lua')), None)
+                if lua_in_zip and not all_depots:
+                    try:
+                        zip_lua_text = zf.read(lua_in_zip).decode('utf-8', errors='ignore')
+                        depot_ids_from_lua = re.findall(r'addappid\(\s*(\d+)\s*\)', zip_lua_text)
+                        depot_ids_from_lua = [d for d in depot_ids_from_lua if d != str(app_id)]
+                        if depot_ids_from_lua:
+                            self.log.info(f"分支内 lua 提供 {len(depot_ids_from_lua)} 个 depot，密钥将从密钥库补全。")
+                    except Exception as e:
+                        self.log.warning(f"读取分支内 lua 失败: {e}")
+
+                # 需要补密钥的 depot 集合
+                missing_key_depots = [d for d in depot_ids_from_lua]
+
+                async with aiofiles.open(lua_filepath, mode="w", encoding="utf-8") as lua_file:
+                    await lua_file.write(f'addappid({app_id})\n')
+                    for depot_id, info in all_depots.items():
+                        key = (info or {}).get("DecryptionKey", "")
+                        if key:
+                            await lua_file.write(f'addappid({depot_id}, 1, "{key}")\n')
+
+                    if missing_key_depots:
+                        # 从缓存的密钥库（Sudama / ManifestHub depotkeys.json）补齐
+                        try:
+                            key_db = await self._get_cached_sudama_data()
+                        except Exception as e:
+                            self.log.warning(f"读取密钥库失败，跳过补 key: {e}")
+                            key_db = {}
+                        patched = 0
+                        for depot_id in missing_key_depots:
+                            key = key_db.get(str(depot_id)) or key_db.get(str(depot_id), "")
+                            if key:
+                                await lua_file.write(f'addappid({depot_id}, 1, "{key}")\n')
+                                patched += 1
+                            else:
+                                await lua_file.write(f'addappid({depot_id})\n')
+                        self.log.info(f"已补全 {patched}/{len(missing_key_depots)} 个 depotkey。")
+
+                    for manifest_path in all_manifest_paths_in_tree:
+                        match = re.search(r'(\d+)_(\w+)\.manifest', Path(manifest_path).name)
+                        if match:
+                            line = f'setManifestid({match.group(1)}, "{match.group(2)}")\n'
+                            await lua_file.write('--' + line if use_st_auto_update else line)
+
+                tool_label = "OpenSteam" if unlocker_type == "opensteam" else "SteamTools"
+                self.log.info(f"已为{tool_label}生成解锁文件: {lua_filepath}")
+
+                if add_all_dlc:
+                    await self._add_free_dlcs_to_lua(app_id, lua_filepath)
+
+                if patch_depot_key:
+                    self.log.info("开始修补创意工坊depotkey...")
+                    await self.patch_lua_with_depotkey(app_id, lua_filepath)
+            else:
+                self.log.info("检测到 GreenLuma/标准模式，将复制 .manifest 文件到 depotcache。")
+                if not all_manifest_paths_in_tree:
+                    self.log.error("GreenLuma 模式需要 .manifest 文件，但 zip 中未找到。")
+                    return False
+                depot_cache_path = self.steam_path / 'depotcache'
+                depot_cache_path.mkdir(parents=True, exist_ok=True)
+                for manifest_path in all_manifest_paths_in_tree:
+                    filename = Path(manifest_path).name
+                    (depot_cache_path / filename).write_bytes(zf.read(manifest_path))
+                    self.log.info(f"已为 GreenLuma 保存清单: {filename}")
+
+                if all_depots:
+                    await self.depotkey_merge(self.steam_path / 'config' / 'config.vdf', {'depots': all_depots})
+                    gl_ids = list(all_depots.keys())
+                    gl_ids.append(app_id)
+                    await self.greenluma_add(list(set(gl_ids)))
+                    self.log.info("已合并密钥并添加到GreenLuma。")
+
+            return True
+
+        except Exception as e:
+            self.log.error(f"通过 codeload 处理 {repo} 的 {app_id} 时出错: {self.stack_error(e)}")
+            return False
+
     async def process_github_manifest(self, app_id: str, repo: str, unlocker_type: str, use_st_auto_update: bool, add_all_dlc: bool, patch_depot_key: bool = False) -> bool:
         github_token = self.config.get("Github_Personal_Token", "")
         headers = {'Authorization': f'Bearer {github_token}'} if github_token else None
@@ -2290,8 +2896,12 @@ class CaiBackend:
         url = f'https://api.github.com/repos/{repo}/branches/{app_id}'
         r_json = await self.fetch_branch_info(url, headers)
         if not (r_json and 'commit' in r_json):
-            self.log.error(f'无法获取 {repo} 中 {app_id} 的分支信息。如果该清单在此仓库中不存在，这是正常现象。')
-            return False
+            # API 走不通（分支不存在 / 配额耗尽 / 网络问题）时，改用 codeload 直接拉分支 zip：
+            # codeload.github.com 不消耗 GitHub API 配额，也不受 60 次/小时限制。
+            self.log.warning(f'无法通过 GitHub API 获取 {repo} 中 {app_id} 的分支信息，改用 codeload 免配额通道重试...')
+            return await self._process_github_repo_via_codeload(
+                app_id, repo, unlocker_type, use_st_auto_update, add_all_dlc, patch_depot_key
+            )
         
         sha, tree_url = r_json['commit']['sha'], r_json['commit']['commit']['tree']['url']
         r2_json = await self.fetch_branch_info(tree_url, headers)
@@ -2302,7 +2912,7 @@ class CaiBackend:
         all_files_in_tree = r2_json.get('tree', [])
         files_to_download = all_files_in_tree[:]
         
-        if unlocker_type == "steamtools" and use_st_auto_update:
+        if self._is_lua_unlocker(unlocker_type) and use_st_auto_update:
             files_to_download = [item for item in all_files_in_tree if not item['path'].endswith('.manifest')]
         
         if not files_to_download and all_files_in_tree: self.log.info("没有需要下载的文件（可能是因为自动更新模式跳过了所有文件）。")
@@ -2330,23 +2940,58 @@ class CaiBackend:
                 all_depots = depots_config.get('depots', {})
             except Exception as e: self.log.error(f"解析 key.vdf 失败: {e}")
 
-        if unlocker_type == "steamtools":
-            self.log.info(f"SteamTools 自动更新模式: {'已启用' if use_st_auto_update else '已禁用'}")
-            stplug_path = self.steam_path / 'config' / 'stplug-in'
+        if self._is_lua_unlocker(unlocker_type):
+            self.log.info(f"{'OpenSteam' if unlocker_type == 'opensteam' else 'SteamTools'} 自动更新模式: {'已启用' if use_st_auto_update else '已禁用'}")
+            stplug_path = self._lua_write_dir(unlocker_type)
+            stplug_path.mkdir(parents=True, exist_ok=True)
             lua_filename = f"{app_id}.lua"
             lua_filepath = stplug_path / lua_filename
+
+            # 部分清单库（如 dc190/ManifestHub）分支里没有 key.vdf，只有一份
+            # <appid>.lua，其中 addappid(depot) 行不带密钥（对应 config 里 has_key: false）。
+            # 这类库里 depot 列表仍以 zip 内的 lua 为准，密钥去密钥库补，
+            # 否则会写出缺 key、无法解锁的 lua。
+            depot_ids_from_lua = []
+            lua_in_tree = next((p for p in downloaded_files if p.lower().endswith(f'{app_id}.lua')), None)
+            if lua_in_tree and not all_depots:
+                try:
+                    zip_lua_text = downloaded_files[lua_in_tree].decode('utf-8', errors='ignore')
+                    depot_ids_from_lua = re.findall(r'addappid\(\s*(\d+)\s*\)', zip_lua_text)
+                    depot_ids_from_lua = [d for d in depot_ids_from_lua if d != str(app_id)]
+                    if depot_ids_from_lua:
+                        self.log.info(f"分支内 lua 提供 {len(depot_ids_from_lua)} 个 depot，密钥将从密钥库补全。")
+                except Exception as e:
+                    self.log.warning(f"读取分支内 lua 失败: {e}")
+
             async with aiofiles.open(lua_filepath, mode="w", encoding="utf-8") as lua_file:
                 await lua_file.write(f'addappid({app_id})\n')
                 for depot_id, info in all_depots.items():
                     key = info.get("DecryptionKey", "")
                     await lua_file.write(f'addappid({depot_id}, 1, "{key}")\n')
+
+                if depot_ids_from_lua:
+                    try:
+                        key_db = await self._get_cached_sudama_data()
+                    except Exception as e:
+                        self.log.warning(f"读取密钥库失败，跳过补 key: {e}")
+                        key_db = {}
+                    patched = 0
+                    for depot_id in depot_ids_from_lua:
+                        key = key_db.get(str(depot_id), "")
+                        if key:
+                            await lua_file.write(f'addappid({depot_id}, 1, "{key}")\n')
+                            patched += 1
+                        else:
+                            await lua_file.write(f'addappid({depot_id})\n')
+                    self.log.info(f"已补全 {patched}/{len(depot_ids_from_lua)} 个 depotkey。")
+
                 for manifest_file_path in all_manifest_paths_in_tree:
                     match = re.search(r'(\d+)_(\w+)\.manifest', Path(manifest_file_path).name)
                     if match:
                         line = f'setManifestid({match.group(1)}, "{match.group(2)}")\n'
                         if use_st_auto_update: await lua_file.write('--' + line)
                         else: await lua_file.write(line)
-            self.log.info(f"已为 SteamTools 生成解锁文件: {app_id}.lua")
+            self.log.info(f"已为 {unlocker_type.capitalize()} 生成解锁文件: {app_id}.lua")
             
             if add_all_dlc:
                 await self._add_free_dlcs_to_lua(app_id, lua_filepath)

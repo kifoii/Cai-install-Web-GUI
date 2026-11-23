@@ -43,7 +43,6 @@ LOG_COLORS = {
 DEFAULT_CONFIG = {
     "Github_Personal_Token": "",
     "Custom_Steam_Path": "",
-    "OpenSteam_Path": "",
     "debug_mode": False,
     "logging_files": True,
     "background_image_path": "",
@@ -361,23 +360,44 @@ class CaiBackend:
 
         return False
 
+    def _find_opensteam_exe_under(self, base: Path | None) -> Path | None:
+        """在 base 目录本身及其一层子目录中查找 OpenSteamKitten.exe。
+
+        子目录只检查名字含 "opensteam" 的（例如 `C:\\Other\\Opensteam`），
+        避免对整个父目录做全量遍历。
+        """
+        if not base:
+            return None
+        try:
+            direct = base / OPENSTEAM_EXE_NAME
+            if direct.is_file():
+                return direct
+        except OSError:
+            pass
+        try:
+            children = list(base.iterdir())
+        except OSError:
+            return None
+        for child in children:
+            try:
+                if not child.is_dir() or 'opensteam' not in child.name.lower():
+                    continue
+                candidate = child / OPENSTEAM_EXE_NAME
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                continue
+        return None
+
     def _detect_opensteam(self) -> bool:
-        """检测 OpenSteam(OpenSteamKitten) 是否可用。
+        """检测 OpenSteam(OpenSteamKitten) 是否可用，无需任何手动配置。
 
         判定条件（满足其一即可）：
         1. Steam 根目录存在 OpenSteam 注入 dll（OpenSteamTool.dll）；
         2. Steam 根目录下存在 config/lua 目录且其中有 .lua 解锁文件；
-        3. 配置中的 OpenSteam_Path 指向存在 OpenSteamKitten.exe 的目录；
-        4. Steam 根目录或其父目录存在 OpenSteamKitten.exe。
+        3. Steam 根目录、或其父目录、或其父目录下名字含 "opensteam" 的子目录中
+           存在 OpenSteamKitten.exe。
         """
-        configured = (self.config.get("OpenSteam_Path") or "").strip()
-        if configured:
-            candidate = Path(configured)
-            if (candidate / OPENSTEAM_EXE_NAME).is_file():
-                return True
-            if candidate.is_dir() and (candidate / 'Resources' / 'dlls').is_dir():
-                return True
-
         if not self.steam_path:
             return False
 
@@ -394,14 +414,8 @@ class CaiBackend:
             except OSError:
                 pass
 
-        # 3. 兜底：Steam 根目录或其父目录存在 OpenSteamKitten.exe
-        for base in (self.steam_path, self.steam_path.parent):
-            try:
-                if base and (base / OPENSTEAM_EXE_NAME).is_file():
-                    return True
-            except OSError:
-                pass
-        return False
+        # 3. 兜底：按可执行文件位置判断
+        return self._get_opensteam_exe_path() is not None
 
     def _is_lua_unlocker(self, unlocker_type: str) -> bool:
         """是否为基于 lua 文件的解锁工具（SteamTools / OpenSteam）。"""
@@ -417,19 +431,18 @@ class CaiBackend:
         return self.steam_path / 'config' / 'stplug-in'
 
     def _get_opensteam_exe_path(self) -> Path | None:
-        """定位 OpenSteamKitten.exe 可执行文件路径。
-        优先使用配置 OpenSteam_Path，其次 Steam 根目录 / 父目录。"""
-        configured = (self.config.get("OpenSteam_Path") or "").strip()
-        candidates = []
-        if configured:
-            candidates.append(Path(configured) / OPENSTEAM_EXE_NAME)
-            candidates.append(Path(configured))
-        if self.steam_path:
-            candidates.append(self.steam_path / OPENSTEAM_EXE_NAME)
-            candidates.append(self.steam_path.parent / OPENSTEAM_EXE_NAME)
-        for c in candidates:
-            if c.is_file():
-                return c
+        """定位 OpenSteamKitten.exe 可执行文件路径，完全依靠自动探测。
+
+        搜索顺序：Steam 根目录 → Steam 父目录 → Steam 父目录下名字含
+        "opensteam" 的子目录（常见布局 `C:\\Other\\Steam` +
+        `C:\\Other\\Opensteam\\OpenSteamKitten.exe`）。
+        """
+        if not self.steam_path:
+            return None
+        for base in (self.steam_path, self.steam_path.parent):
+            found = self._find_opensteam_exe_under(base)
+            if found:
+                return found
         return None
 
     def stack_error(self, exception: Exception) -> str:

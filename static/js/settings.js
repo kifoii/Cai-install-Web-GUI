@@ -4,7 +4,6 @@ class SettingsManager {
         this.elements = {
             githubToken: document.getElementById('githubToken'),
             steamPath: document.getElementById('steamPath'),
-            opensteamPath: document.getElementById('opensteamPath'),
             steamPathStatus: document.getElementById('steamPathStatus'),
             debugMode: document.getElementById('debugMode'),
             loggingFiles: document.getElementById('loggingFiles'),
@@ -389,7 +388,6 @@ class SettingsManager {
             if (data.success) {
                 this.elements.githubToken.value = data.config.github_token || '';
                 this.elements.steamPath.value = data.config.steam_path || '';
-                this.elements.opensteamPath.value = data.config.opensteam_path || '';
                 this.elements.debugMode.checked = data.config.debug_mode || false;
                 this.elements.loggingFiles.checked = data.config.logging_files !== false;
                 this.elements.showConsoleOnStartup.checked = data.config.show_console_on_startup || false;
@@ -422,7 +420,6 @@ class SettingsManager {
         const config = {
             github_token: this.elements.githubToken.value.trim(),
             steam_path: this.elements.steamPath.value.trim(),
-            opensteam_path: this.elements.opensteamPath.value.trim(),
             debug_mode: this.elements.debugMode.checked,
             logging_files: this.elements.loggingFiles.checked,
             show_console_on_startup: this.elements.showConsoleOnStartup.checked,

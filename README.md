@@ -68,7 +68,7 @@ pwsh -NoProfile -File build.ps1
    设置 → 填入 GitHub Personal Access Token。匿名配额仅 60 次/小时，带 token 提升到 5000 次/小时。
 
 2. **（OpenSteam 用户）确认解锁工具**
-   设置 → "OpenSteamKitten 路径" 填 `C:\Other\Opensteam`（留空自动检测）。配置状态应显示 "已检测到 OpenSteam (OpenSteamKitten)"。
+   无需手动配置路径，程序会自动检测：Steam 根目录存在 `config\lua` 目录、或存在 `OpenSteamTool.dll`、或 Steam 根目录/其父目录存在 `OpenSteamKitten.exe`，任一成立即识别为 OpenSteam。配置状态应显示 "已检测到 OpenSteam (OpenSteamKitten)"。
 
 3. **搜索游戏并入库**
    首页输入游戏名或 AppID → 选清单源 → 勾选需要的选项 → 开始任务。lua 会写入 `<Steam>\config\lua\{appid}.lua`。

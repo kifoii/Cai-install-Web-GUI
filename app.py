@@ -697,7 +697,6 @@ def get_detailed_config():
         return jsonify({"success": True, "config": {
             "github_token": config.get("Github_Personal_Token", ""),
             "steam_path": str(steam_path_str),
-            "opensteam_path": config.get("OpenSteam_Path", ""),
             "debug_mode": config.get("debug_mode", False),
             "logging_files": config.get("logging_files", True),
             "steam_path_is_auto": steam_path_is_auto,
@@ -733,14 +732,13 @@ def update_config():  # 改为同步函数
         
         # 更新所有可能的键
         updatable_keys = [
-            "github_token", "steam_path", "opensteam_path", "debug_mode", "logging_files",
+            "github_token", "steam_path", "debug_mode", "logging_files",
             "background_image_path", "background_blur", "background_saturation", 
             "background_brightness", "show_console_on_startup", "auto_port", "force_unlocker_type"
         ]
         key_map = {
             "github_token": "Github_Personal_Token",
-            "steam_path": "Custom_Steam_Path",
-            "opensteam_path": "OpenSteam_Path"
+            "steam_path": "Custom_Steam_Path"
         }
         
         for key in updatable_keys:

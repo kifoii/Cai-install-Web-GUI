@@ -94,6 +94,9 @@ class STConverter:
         return lua_content, metadata
 
 class CaiBackend:
+    # 环境信息（Steam 路径 / 解锁工具）每个进程只输出一次，避免请求级重复刷日志
+    _env_logged = False
+
     def __init__(self):
         self.project_root = Path.cwd()
         self.client: httpx.AsyncClient | None = None
@@ -103,8 +106,8 @@ class CaiBackend:
         self.lock = asyncio.Lock()
         self.temp_path = self.project_root / 'temp'
         self.log = self._init_log()
-        self.name_cache: Dict[str, str] = {} # NEW: 添加游戏名称缓存
-        self.cover_cache: Dict[str, str] = {} # NEW: 游戏封面缓存（appid -> 可用图片URL）
+        self.name_cache: Dict[str, str] = {}
+        self.cover_cache: Dict[str, str] = {}
 
     async def __aenter__(self):
         self.client = httpx.AsyncClient(verify=False, trust_env=True)
@@ -125,7 +128,7 @@ class CaiBackend:
             logger.addHandler(stream_handler)
         return logger
 
-    def _configure_logger(self):
+    def _configure_logger(self, verbose: bool = True):
         if not self.config:
             self.log.warning("无法应用日志配置，因为配置尚未加载。")
             return
@@ -135,7 +138,8 @@ class CaiBackend:
         for handler in self.log.handlers:
             if isinstance(handler, logging.StreamHandler):
                 handler.setLevel(level)
-        self.log.debug(f"日志等级已设置为: {'DEBUG' if is_debug else 'INFO'}")
+        if verbose:
+            self.log.debug(f"日志等级已设置为: {'DEBUG' if is_debug else 'INFO'}")
         self.log.handlers = [h for h in self.log.handlers if not isinstance(h, logging.FileHandler)]
         if self.config.get("logging_files", True):
             logs_dir = self.project_root / 'logs'
@@ -146,8 +150,9 @@ class CaiBackend:
             file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
             file_handler.setFormatter(file_formatter)
             self.log.addHandler(file_handler)
-            self.log.info(f"已启用文件日志，将保存到: {log_file_path}")
-        else:
+            if verbose:
+                self.log.info(f"已启用文件日志: {log_file_path}")
+        elif verbose:
             self.log.info("文件日志已禁用。")
 
     def _compare_versions(self, v1: str, v2: str) -> int:
@@ -290,39 +295,46 @@ class CaiBackend:
     async def initialize(self) -> Literal["steamtools", "greenluma", "opensteam", "conflict", "none", None]:
         if not self.config: self.config = await self.load_config()
         if self.config is None: return None
-        self._configure_logger()
+        # initialize() 每个 HTTP 请求都会跑一次，环境信息只打一次，避免日志被重复刷屏
+        verbose = not CaiBackend._env_logged
+        self._configure_logger(verbose=verbose)
         
         self.steam_path = self.get_steam_path()
         if not self.steam_path or not self.steam_path.exists():
             self.log.error('无法确定有效的Steam路径。请在设置中手动指定。')
             return None
-        self.log.info(f"Steam路径: {self.steam_path}")
+        if verbose:
+            self.log.info(f"Steam路径: {self.steam_path}")
 
         force_unlocker = self.config.get("force_unlocker_type", "auto")
 
         if force_unlocker in ["steamtools", "greenluma", "opensteam"]:
             self.unlocker_type = force_unlocker
-            self.log.warning(f"已根据配置强制使用解锁工具: {force_unlocker.capitalize()}")
+            if verbose:
+                self.log.info(f"已根据配置强制使用解锁工具: {force_unlocker.capitalize()}")
         else:
             is_steamtools = self._detect_steamtools()
             is_greenluma = any((self.steam_path / dll).exists() for dll in ['GreenLuma_2025_x86.dll', 'GreenLuma_2025_x64.dll'])
             is_opensteam = self._detect_opensteam()
             detected = [name for name, ok in (("steamtools", is_steamtools), ("greenluma", is_greenluma), ("opensteam", is_opensteam)) if ok]
             if len(detected) >= 2:
-                self.log.error(f"环境冲突：同时检测到 {len(detected)} 种解锁工具 ({', '.join(detected)})！请在设置中强制指定一个。")
+                if verbose:
+                    self.log.error(f"环境冲突：同时检测到 {len(detected)} 种解锁工具 ({', '.join(detected)})！请在设置中强制指定一个。")
                 self.unlocker_type = "conflict"
             elif is_opensteam:
-                self.log.info("自动检测到解锁工具: OpenSteam (OpenSteamKitten)")
+                if verbose: self.log.info("自动检测到解锁工具: OpenSteam (OpenSteamKitten)")
                 self.unlocker_type = "opensteam"
             elif is_steamtools:
-                self.log.info("自动检测到解锁工具: SteamTools")
+                if verbose: self.log.info("自动检测到解锁工具: SteamTools")
                 self.unlocker_type = "steamtools"
             elif is_greenluma:
-                self.log.info("自动检测到解锁工具: GreenLuma")
+                if verbose: self.log.info("自动检测到解锁工具: GreenLuma")
                 self.unlocker_type = "greenluma"
             else:
-                self.log.warning("未能自动检测到解锁工具。将默认使用标准模式（可能需要手动配置）。")
+                if verbose: self.log.warning("未能自动检测到解锁工具，将使用标准模式（可能需要手动配置）。")
                 self.unlocker_type = "none"
+
+        CaiBackend._env_logged = True
 
         try:
             (self.steam_path / 'config' / 'stplug-in').mkdir(parents=True, exist_ok=True)
@@ -496,14 +508,14 @@ class CaiBackend:
         try:
             custom_steam_path = self.config.get("Custom_Steam_Path", "").strip()
             if custom_steam_path:
-                self.log.info(f"正使用配置文件中的自定义Steam路径: {custom_steam_path}")
+                self.log.debug(f"使用配置中的自定义 Steam 路径: {custom_steam_path}")
                 return Path(custom_steam_path)
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Valve\Steam')
             steam_path, _ = winreg.QueryValueEx(key, 'SteamPath')
             winreg.CloseKey(key)
             return Path(steam_path)
         except Exception:
-            self.log.error(f'获取Steam路径失败。请检查Steam是否正确安装，或在config.json中设置Custom_Steam_Path。')
+            self.log.error('获取 Steam 路径失败，请在设置中手动指定。')
             return None
             
     # --- NEW: File Manager Methods ---
@@ -2292,17 +2304,19 @@ class CaiBackend:
             return True
 
     async def checkcn(self) -> bool:
+        """探测网络区域并设置 IS_CN 环境变量；结果在当前进程内只打印一次。"""
+        if 'IS_CN' in os.environ:
+            return os.environ['IS_CN'] == 'yes'
         try:
             req = await self.client.get('https://mips.kugou.com/check/iscn?&format=json', timeout=5)
             body = req.json()
             is_cn = bool(body['flag'])
             os.environ['IS_CN'] = 'yes' if is_cn else 'no'
-            if is_cn: self.log.info(f"检测到区域为中国大陆 ({body['country']})。将使用国内镜像。")
-            else: self.log.info(f"检测到区域为非中国大陆 ({body['country']})。将直接使用GitHub。")
+            self.log.info(f"网络区域: {body.get('country', '未知')}，使用{'国内镜像' if is_cn else 'GitHub 直连'}")
             return is_cn
         except Exception:
             os.environ['IS_CN'] = 'yes'
-            self.log.warning('无法确定服务器位置，默认您在中国大陆。')
+            self.log.debug('区域探测失败，默认使用国内镜像。')
             return True
 
     def parse_lua_file_for_depots(self, lua_file_path: str) -> Dict:
@@ -2343,16 +2357,17 @@ class CaiBackend:
         urls = [f'https://raw.githubusercontent.com/{repo}/{sha}/{path}']
         if os.environ.get('IS_CN') == 'yes':
             urls = [f'https://gh-proxy.org/https://github.com/{repo}/{sha}/{path}',f'https://cdn.gh-proxy.org/https://github.com/{repo}/{sha}/{path}',f'https://edgeone.gh-proxy.org/https://github.com/{repo}/{sha}/{path}',f'https://github.chenc.dev/github.com/{repo}/{sha}/{path}',f'https://fastgit.cc/https://github.com/{repo}/{sha}/{path}',f'https://gh.llkk.cc/https://github.com/{repo}/{sha}/{path}',f'https://gh.akass.cn/{repo}/{sha}/{path}',f'https://raw.githubusercontent.com/{repo}/{sha}/{path}']
+        # 逐个镜像尝试，失败原因只在调试模式下逐条输出，成功后不再重复刷屏
         for url in urls:
             try:
                 r = await self.client.get(url, timeout=30)
                 if r.status_code == 200:
-                    self.log.info(f'下载成功: {path} (来自 {url.split("/")[2]})')
+                    self.log.debug(f'下载成功: {path} (来自 {url.split("/")[2]})')
                     return r.content
-                self.log.error(f'下载失败: {path} (来自 {url.split("/")[2]}) - 状态码: {r.status_code}')
+                self.log.debug(f'镜像 {url.split("/")[2]} 返回 {r.status_code}: {path}')
             except httpx.RequestError as e:
-                self.log.error(f'下载失败: {path} (来自 {url.split("/")[2]}) - 错误: {e}')
-        raise Exception(f'尝试所有镜像后仍无法下载文件: {path}')
+                self.log.debug(f'镜像 {url.split("/")[2]} 请求失败: {path} - {e}')
+        raise Exception(f'所有镜像均无法下载文件: {path}')
 
     async def greenluma_add(self, depot_id_list: list) -> bool:
         app_list_path = self.steam_path / 'AppList'

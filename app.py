@@ -608,69 +608,123 @@ def manager_force_unlock():
 
 # --- END of File Manager API ---
 
-# 封面图代理：浏览器在国内直连 Steam CDN 会 ERR_CONNECTION_CLOSED / ERR_BLOCKED_BY_ORB，
-# 由后端取图后本地回传，并落地磁盘缓存避免重复拉取。
-_COVER_CACHE_DIR = project_root / 'cache' / 'covers'
+# 封面图代理：浏览器直连 Steam CDN 会 ERR_CONNECTION_CLOSED / ERR_BLOCKED_BY_ORB，
+# 由后端取图后流式回传。只在进程内存里暂存，不写磁盘。
+_cover_mem_cache = {}      # appid -> (bytes, mimetype)
+_COVER_MEM_LIMIT = 200     # 最多缓存 200 张，约 10MB 内存
+
 _ALLOWED_COVER_HOSTS = (
     'steamstatic.com',
     'steampowered.com',
     'akamaihd.net',
+    'max-c.com',
 )
 
 
-@app.route('/api/cover/<appid>')
-def cover_image(appid):
+def _remember_cover(appid, data, mimetype):
+    if len(_cover_mem_cache) >= _COVER_MEM_LIMIT:
+        _cover_mem_cache.pop(next(iter(_cover_mem_cache)))
+    _cover_mem_cache[appid] = (data, mimetype)
+
+
+def _fetch_image(url, referer=None):
+    """下载单张图片，校验是 JPEG，返回 (bytes, mimetype) 或 None。"""
     import httpx
-    from flask import Response
 
-    if not appid.isdigit():
-        return ('', 400)
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    if referer:
+        headers['Referer'] = referer
+    try:
+        resp = httpx.get(url, headers=headers, timeout=15,
+                         follow_redirects=True, verify=False)
+        if resp.status_code == 200 and resp.content[:3] == b'\xff\xd8\xff':
+            return resp.content, 'image/jpeg'
+    except Exception:
+        pass
+    return None
 
-    cache_file = _COVER_CACHE_DIR / f'{appid}.jpg'
-    if cache_file.exists() and cache_file.stat().st_size > 0:
-        return Response(cache_file.read_bytes(), mimetype='image/jpeg',
-                        headers={'Cache-Control': 'public, max-age=604800'})
 
-    candidates = [
-        f'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{appid}/header.jpg',
-        f'https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg',
-        f'https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/{appid}/header.jpg',
-        f'https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg',
-        f'https://steamcdn-a.akamaihd.net/steam/apps/{appid}/header.jpg',
-    ]
+def _cover_from_steam(appid):
+    """Steam 官方图片源。
 
-    # 先尝试商店接口拿到带 hash 的准确地址（旧路径对新游戏是 404）
+    商店接口能给出带 hash 的 store_item_assets 地址，新上架的游戏只有这一条路径有图；
+    拿不到接口数据时退回按 appid 拼接的经典路径。
+    """
+    import httpx
+
+    candidates = []
+
+    # 优先：商店接口给出的 header_image / capsule_image（带 hash，最准）
     try:
         r = httpx.get('https://store.steampowered.com/api/appdetails',
                       params={'appids': appid, 'l': 'schinese'},
                       headers={'User-Agent': 'Mozilla/5.0'}, timeout=12, verify=False)
         if r.status_code == 200:
             node = (r.json() or {}).get(str(appid)) or {}
-            header_image = ((node.get('data') or {}).get('header_image') or '').strip()
-            if header_image:
-                candidates.insert(0, header_image)
+            data = node.get('data') or {}
+            for key in ('header_image', 'capsule_image', 'capsule_imagev5'):
+                url = (data.get(key) or '').strip()
+                if url:
+                    candidates.append(url)
     except Exception:
         pass
 
-    for url in candidates:
-        host_ok = any(url.split('/')[2].endswith(h) for h in _ALLOWED_COVER_HOSTS)
-        if not host_ok:
-            continue
-        try:
-            resp = httpx.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15,
-                             follow_redirects=True, verify=False)
-            if resp.status_code == 200 and resp.content[:3] == b'\xff\xd8\xff':
-                try:
-                    _COVER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                    cache_file.write_bytes(resp.content)
-                except Exception:
-                    pass
-                return Response(resp.content, mimetype='image/jpeg',
-                                headers={'Cache-Control': 'public, max-age=604800'})
-        except Exception:
-            continue
+    # 兜底：经典路径（老游戏这些路径都还在）
+    candidates += [
+        f'https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg',
+        f'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{appid}/header.jpg',
+        f'https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg',
+        f'https://steamcdn-a.akamaihd.net/steam/apps/{appid}/header.jpg',
+    ]
 
-    return ('', 404)
+    for url in candidates:
+        if not any(url.split('/')[2].endswith(h) for h in _ALLOWED_COVER_HOSTS):
+            continue
+        got = _fetch_image(url)
+        if got:
+            return got
+    return None
+
+
+def _cover_from_xiaoheihe(appid):
+    """小黑盒兜底。
+
+    图床格式为 heyboxbj.max-c.com/gameimg/steam_item_assets/<appid>/<hash>.jpg，
+    hash 取不到稳定映射，因此这里只在 Steam 失败后尝试常见别名路径。
+    """
+    patterns = [
+        f'https://heyboxbj.max-c.com/gameimg/steam_item_assets/{appid}/header.jpg',
+        f'https://heyboxbj.max-c.com/gameimg/steam_item_assets/{appid}/capsule_231x87.jpg',
+        f'https://cdn.max-c.com/heybox/game/{appid}/header.jpg',
+    ]
+    for url in patterns:
+        got = _fetch_image(url, referer='https://www.xiaoheihe.cn/')
+        if got:
+            return got
+    return None
+
+
+@app.route('/api/cover/<appid>')
+def cover_image(appid):
+    from flask import Response
+
+    if not appid.isdigit():
+        return ('', 400)
+
+    cached = _cover_mem_cache.get(appid)
+    if cached:
+        data, mimetype = cached
+        return Response(data, mimetype=mimetype,
+                        headers={'Cache-Control': 'public, max-age=86400'})
+
+    result = _cover_from_steam(appid) or _cover_from_xiaoheihe(appid)
+    if not result:
+        return ('', 404)
+
+    data, mimetype = result
+    _remember_cover(appid, data, mimetype)
+    return Response(data, mimetype=mimetype,
+                    headers={'Cache-Control': 'public, max-age=86400'})
 
 
 @app.route('/api/config/detailed')

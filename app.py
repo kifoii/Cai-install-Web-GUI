@@ -268,23 +268,17 @@ def get_sources():  # 改为同步函数
                 await backend.initialize()
                 
                 # Built-in sources
-                # 说明：下列 5 个旧 zip 源已全部失效（2026-11 实测：printedwaste 返回 404、
-                # cysaw 返回 0 字节空响应、furcate 返回 Cloudflare 挑战页、walftech 返回 403、
-                # steamdatabase 返回 404），已从下拉列表移除，避免用户选中后必然失败。
-                # 新增的 ManifestHub3 系库里，实测 manilua-hub / steamtoolsapp / ooiiuur 三个
-                # 与 steamtools-games/ManifestHub3 是同一数据库的克隆（同 appid 的 zip 内容
-                # sha256 完全一致，仅 zip 时间戳字节不同），不提供额外覆盖，因此不再单列。
-                # dc190/ManifestHub 虽只有 271 个分支，但与 ManifestHub3 分支集合不重合
-                # （例如 2928600 只在 dc190 里有），保留作为补充。
+                # 说明：printedwaste / cysaw / furcate / walftech / steamdatabase 五个旧 zip 源
+                # 实测已全部失效（404 / 0 字节 / Cloudflare 挑战页 / 403 / 404），不再列出。
                 builtin_sources = {
                     "自动搜索GitHub": "search",
-                    "清单不求人库（仅清单）": "buqiuren",
-                    "steamtools.games（6万+分支库）": "steamtools_games",
                     "SteamAutoCracks/ManifestHub(2) （仅密钥）": "steamautocracks_v2",
                     "Sudama库(仅密钥）": "sudama",
+                    "清单不求人库（仅清单）": "buqiuren",
+                    "steamtools.games": "steamtools_games",
                     "GitHub (Auiowu)": "Auiowu/ManifestAutoUpdate",
-                    "GitHub (ManifestHub3 主库)": "steamtools-games/ManifestHub3",
-                    "GitHub (dc190 fork)": "dc190/ManifestHub",
+                    "GitHub (ManifestHub3)": "steamtools-games/ManifestHub3",
+                    "GitHub (dc190)": "dc190/ManifestHub",
                     "GitHub (SAC)": "SteamAutoCracks/ManifestHub"
                 }
                 

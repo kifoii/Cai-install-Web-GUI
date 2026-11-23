@@ -1,8 +1,8 @@
-# Cai Install Web GUI — OpenSteam 适配版
+# Cai Install Web GUI
 
 > **本项目是 [pvzcxw/Cai-install-Web-GUI](https://github.com/pvzcxw/Cai-install-Web-GUI) 的二次开发分支。**
 >
-> **原作者：[pvzcxw](https://github.com/pvzcxw)** — 原始项目 `Cai Install` 全系（Cai install XP / GUI / Web UI / Reborn）由 pvzcxw 独立开发，2023–2026 年间累计更新 70 余个版本。原作者已于 2026 年 6 月宣布全系停更并以 **MIT 协议** 开源，明确欢迎二改（"欢迎大家二改！继承 cai install 的 ip 精神！"）。
+> **原作者：[pvzcxw](https://github.com/pvzcxw)** — 原始项目 `Cai Install` 全系（Cai install XP / GUI / Web UI / Reborn）由 pvzcxw 独立开发，2023–2026 年间累计更新 70 余个版本。原作者已于 2026 年 6 月宣布全系停更并以 **MIT 协议** 开源。
 >
 > 本分支仅在其基础上做**适配与修复**，不改变原作者身份与著作权。原始 LICENSE（MIT, Copyright (c) 2026 pvzcxw）完整保留。
 
@@ -138,6 +138,6 @@ Copyright (c) 2026 pvzcxw
 
 **原项目已停更，本分支为社区适配维护。**
 
-如果这个分支对你有帮助，请先给原作 [pvzcxw/Cai-install-Web-GUI](https://github.com/pvzcxw/Cai-install-Web-GUI) 一个 ⭐
+如果这个分支对你有帮助，可以给 [pvzcxw/Cai-install-Web-GUI](https://github.com/pvzcxw/Cai-install-Web-GUI) 点一个 ⭐
 
 </div>

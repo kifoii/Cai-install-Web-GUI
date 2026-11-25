@@ -104,6 +104,8 @@ class STConverter:
 class CaiBackend:
     # 环境信息（Steam 路径 / 解锁工具）每个进程只输出一次，避免请求级重复刷日志
     _env_logged = False
+    # 补充搜索源的结果缓存（关键词 -> 结果列表），该接口响应时间波动大，命中过就不再重复等
+    _search_extra_cache: Dict[str, List[Dict]] = {}
 
     def __init__(self):
         self.project_root = Path.cwd()
@@ -3104,12 +3106,98 @@ class CaiBackend:
         if match: return match.group(1)
         return user_input if user_input.isdigit() else None
 
+    async def _search_storesearch(self, game_name: str) -> List[Dict]:
+        """Steam 商店官方搜索，返回 [{appid, name, header_image}]。"""
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        results: List[Dict] = []
+        for lang, cc in (('schinese', 'cn'), ('english', 'us')):
+            # 商店搜索接口偶发超时，每个语言各给两次机会
+            for attempt in range(2):
+                try:
+                    r = await self.client.get(
+                        'https://store.steampowered.com/api/storesearch/',
+                        params={'term': game_name, 'l': lang, 'cc': cc},
+                        headers=headers,
+                        timeout=20,
+                    )
+                    if r.status_code == 403:
+                        self.log.warning("商店搜索接口被拦截 (403)，稍后重试。")
+                        break
+                    r.raise_for_status()
+                    payload = r.json()
+                except Exception as e:
+                    self.log.debug(f"storesearch({lang}) 第 {attempt + 1} 次请求失败: {type(e).__name__}")
+                    continue
+
+                items = payload.get('items') if isinstance(payload, dict) else None
+                if not isinstance(items, list) or not items:
+                    break
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    appid = item.get('id')
+                    name = item.get('name')
+                    if appid and name:
+                        results.append({
+                            'appid': str(appid),
+                            'name': str(name),
+                            'header_image': item.get('tiny_image') or '',
+                        })
+                if results:
+                    break
+            if results:
+                break
+        return results
+
+    async def _search_caigames(self, game_name: str) -> List[Dict]:
+        """第三方索引搜索，作为官方接口的补充。
+
+        官方 storesearch 只返回很少的条目（实测 "Harem Hunter" 仅 1 条），
+        这个接口会同时给出中英文名与更多同系列作品，便于认领冷门 / 成人向作品。
+        该接口响应时间波动很大（0.5s ~ 25s），所以给一个短超时：来不及就跳过，
+        不能让它把整个搜索拖到几十秒。
+        """
+        try:
+            r = await self.client.get(
+                'https://api.9178666.xyz/search',
+                params={'q': game_name},
+                headers={
+                    'X-Client-Auth': 'CaiGames-pvzcxw',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json',
+                },
+                timeout=6,
+            )
+            if r.status_code != 200:
+                self.log.debug(f"补充搜索源返回 {r.status_code}，忽略。")
+                return []
+            payload = r.json()
+            items = payload.get('data') if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                return []
+            results: List[Dict] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                appid = item.get('appid')
+                name = item.get('name')
+                if appid and name:
+                    results.append({
+                        'appid': str(appid),
+                        'name': str(name),
+                        'header_image': item.get('image') or '',
+                    })
+            return results
+        except Exception as e:
+            self.log.debug(f"补充搜索源失败: {type(e).__name__}")
+            return []
+
     async def find_appid_by_name(self, game_name: str) -> List[Dict]:
         """按名称搜索游戏，返回 [{appid, name, header_image}]。
 
-        使用 Steam 商店的 storesearch 接口，把接口返回的条目原样全部交给前端展示，
-        由使用者自己认领正确的那一条。先按简体中文区搜一次，为空时再按英文搜一次，
-        覆盖只登记了英文名的作品。
+        两个搜索源并发查询后按 appid 合并去重，官方结果排前面、补充源独有的排后面，
+        全部原样交给前端展示，由使用者自己认领正确的那一条。
         """
         game_name = (game_name or "").strip()
         if not game_name:
@@ -3117,53 +3205,36 @@ class CaiBackend:
 
         self.log.info(f"正在尝试搜索游戏: {game_name}")
 
-        url = 'https://store.steampowered.com/api/storesearch/'
-        headers = {'User-Agent': 'Mozilla/5.0'}
-
-        games_list: List[Dict] = []
         try:
-            for lang, cc in (('schinese', 'cn'), ('english', 'us')):
-                # 商店搜索接口偶发超时，每个语言各给两次机会
-                for attempt in range(2):
-                    try:
-                        r = await self.client.get(
-                            url,
-                            params={'term': game_name, 'l': lang, 'cc': cc},
-                            headers=headers,
-                            timeout=20,
-                        )
-                        if r.status_code == 403:
-                            self.log.warning("搜索接口被拦截 (403)，请稍后重试。")
-                            break
-                        r.raise_for_status()
-                        payload = r.json()
-                    except Exception as e:
-                        self.log.debug(f"storesearch({lang}) 第 {attempt + 1} 次请求失败: {type(e).__name__}")
-                        continue
-
-                    items = payload.get('items') if isinstance(payload, dict) else None
-                    if not isinstance(items, list) or not items:
-                        break
-
-                    for item in items:
-                        if not isinstance(item, dict):
-                            continue
-                        appid = item.get('id')
-                        name = item.get('name')
-                        if appid and name:
-                            games_list.append({
-                                'appid': str(appid),
-                                'name': str(name),
-                                'header_image': item.get('tiny_image') or '',
-                            })
-
-                    if games_list:
-                        break
-
-                if games_list:
-                    break
+            official = await self._search_storesearch(game_name)
         except Exception as e:
             self.log.error(f"搜索游戏 '{game_name}' 失败: {self.stack_error(e)}")
+            official = []
+
+        # 补充源只在官方结果过少时才问：那个接口响应时间在 0.5s ~ 22s 之间乱跳，
+        # 常见作品官方已经给出足够候选，为几条额外结果把每次搜索拖到几秒不划算。
+        cache_key = game_name.lower()
+        extra: List[Dict] = list(CaiBackend._search_extra_cache.get(cache_key, []))
+        if not extra and len(official) < 3:
+            try:
+                extra = await asyncio.wait_for(self._search_caigames(game_name), timeout=4.0)
+                if extra:
+                    CaiBackend._search_extra_cache[cache_key] = extra
+                    if len(CaiBackend._search_extra_cache) > 100:
+                        CaiBackend._search_extra_cache.pop(next(iter(CaiBackend._search_extra_cache)))
+            except asyncio.TimeoutError:
+                self.log.debug("补充搜索源超过 4s 未返回，只用官方结果。")
+            except Exception as e:
+                self.log.debug(f"补充搜索源失败: {type(e).__name__}")
+
+        games_list: List[Dict] = []
+        seen = set()
+        for item in list(official) + list(extra):
+            appid = item.get('appid')
+            if not appid or appid in seen:
+                continue
+            seen.add(appid)
+            games_list.append(item)
 
         if games_list:
             self.log.info(f"成功找到 {len(games_list)} 个结果")

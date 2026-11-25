@@ -1152,21 +1152,45 @@ class CaiBackend:
                 pass
             return []
 
-        # 1. 尝试 SteamCMD API。它稳定可用（1~2 秒），所以放第一顺位
+        # 1. 尝试 SteamCMD API（列表快但可能不全）
         self.log.debug(f"尝试从 SteamCMD API 获取 AppID {appid} 的DLC...")
+        steamcmd_dlcs: List[str] = []
         data = await self.http_get_safe(f"https://api.steamcmd.net/v1/info/{appid}", timeout=20, max_retries=2)
         if data:
             try:
-                dlc_ids = parse_steamcmd_style_json(data.json())
-                if dlc_ids:
-                    self.log.info(f"从 SteamCMD API 成功获取到 {len(dlc_ids)} 个DLC")
-                    return dlc_ids
-                self.log.debug(f"SteamCMD API 中 AppID {appid} 没有DLC信息")
+                steamcmd_dlcs = parse_steamcmd_style_json(data.json())
             except Exception as e:
-                self.log.warning(f"解析 SteamCMD API 响应失败: {e}")
-        else:
-            self.log.warning(f"无法从 SteamCMD API 获取 AppID {appid} 的数据")
-        
+                self.log.debug(f"解析 SteamCMD API 响应失败: {e}")
+
+        # 2. 官方 appdetails 的 dlc 字段更完整（实测 1141220 有 4 个 DLC，
+        #    SteamCMD 的 listofdlc 只列了 2 个），所以两边都要查并取并集。
+        official_dlcs: List[str] = []
+        self.log.debug(f"尝试从 Steam 官方 API 获取 AppID {appid} 的DLC...")
+        for api_url in (
+            f"https://store.steampowered.com/api/appdetails?appids={appid}&l=schinese",
+            f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english",
+        ):
+            data = await self.http_get_safe(api_url, timeout=25, max_retries=2, retry_delay=2.0)
+            if not data:
+                continue
+            try:
+                app_data = data.json().get(str(appid), {})
+                if app_data.get("success") and "data" in app_data:
+                    dlc_list = app_data["data"].get("dlc") or []
+                    official_dlcs = [str(d) for d in dlc_list]
+                    if official_dlcs:
+                        break
+            except Exception as e:
+                self.log.debug(f"解析 Steam 官方 API 响应失败 ({api_url}): {e}")
+
+        merged = sorted(set(steamcmd_dlcs) | set(official_dlcs), key=lambda x: int(x) if x.isdigit() else 0)
+        if merged:
+            if steamcmd_dlcs and official_dlcs and len(official_dlcs) > len(steamcmd_dlcs):
+                self.log.info(f"获取到 {len(merged)} 个DLC（SteamCMD {len(steamcmd_dlcs)} 个 + 官方补充）")
+            else:
+                self.log.info(f"获取到 {len(merged)} 个DLC")
+            return merged
+
         # 3. ddxnb 垫底：该源目前恒返 403 或读超时，放最后以免拖慢正常路径
         self.log.debug(f"尝试从 ddxnb源 获取 AppID {appid} 的DLC...")
         data = await self.http_get_safe(f"https://steam.ddxnb.cn/v1/info/{appid}", timeout=8, max_retries=1)
@@ -1179,31 +1203,7 @@ class CaiBackend:
             except Exception as e:
                 self.log.debug(f"解析 ddxnb源 响应失败: {e}")
 
-        # 4. 降级：使用官方 API (兜底)
-        self.log.debug(f"尝试从 Steam 官方 API 获取 AppID {appid} 的DLC...")
-        api_variants = [
-            f"https://store.steampowered.com/api/appdetails?appids={appid}&l=schinese",
-            f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english",
-            f"https://store.steampowered.com/api/appdetails?appids={appid}"
-        ]
-        
-        for api_url in api_variants:
-            data = await self.http_get_safe(api_url, timeout=25, max_retries=2, retry_delay=2.0)
-            if data:
-                try:
-                    j = data.json()
-                    app_data = j.get(str(appid), {})
-                    if app_data.get("success") and "data" in app_data:
-                        dlc_list = app_data["data"].get("dlc", [])
-                        if dlc_list:
-                            dlc_ids = [str(d) for d in dlc_list]
-                            self.log.info(f"从 Steam 官方 API 成功获取到 {len(dlc_ids)} 个DLC")
-                            return dlc_ids
-                except Exception as e:
-                    self.log.warning(f"解析 Steam 官方 API 响应失败 ({api_url}): {e}")
-                    continue
-        
-        self.log.info(f"未找到 AppID {appid} 的DLC信息（已尝试所有数据源）")
+        self.log.debug(f"未找到 AppID {appid} 的DLC信息（已尝试所有数据源）")
         return []
 
     # NEW: Updated depot retrieval function with better error handling
@@ -1809,7 +1809,7 @@ class CaiBackend:
             self.log.info(f"已为{tool_label}生成解锁文件: {lua_filepath}（匹配到 {matched_keys}/{len(depot_manifest_map)} 个 depotkey）")
 
             if add_all_dlc:
-                await self._add_free_dlcs_to_lua(app_id, lua_filepath)
+                await self._add_free_dlcs_to_lua(app_id, lua_filepath, use_st_auto_update)
 
             if patch_depot_key:
                 self.log.info("开始修补创意工坊depotkey...")
@@ -2073,7 +2073,7 @@ class CaiBackend:
             
             # 处理 DLC
             if add_all_dlc:
-                await self._add_free_dlcs_to_lua(app_id, lua_filepath)
+                await self._add_free_dlcs_to_lua(app_id, lua_filepath, use_st_auto_update)
             
             # 处理创意工坊密钥修补（复用已下载的 depotkeys_data）
             if patch_depot_key:
@@ -2357,17 +2357,40 @@ class CaiBackend:
             return False
 
     async def _get_from_mirrors(self, sha: str, path: str, repo: str) -> bytes:
-        """并发向所有镜像取同一个文件，取最先返回 200 的那个。
+        """取仓库某个分支下的单个文件。
 
-        串行尝试的问题很实际：镜像列表里前面几个常年超时，等轮到能用的那个时
-        已经过去几十秒，甚至整体超时失败。并发后总耗时约等于最快可用镜像的响应时间。
+        先单发 raw.githubusercontent.com：实测它一直可用（连发 10 次全 200，不限流），
+        而列出来的国内镜像 2026-11 实测全部失效（404 / ConnectError / 403）。
+        只有 raw 失败时才并发试镜像，避免一上来就同时打十几个域名。
+
+        超时给到 120 秒：清单文件单个就有几 MB（实测 1091501 那个 2.8MB / 6.8 秒），
+        原来 25 秒对慢速线路上的大文件不够，表现为随机某个文件超时、整个任务失败。
+        每个文件重试 3 次，避免瞬时抖动直接废掉整次入库。
         """
         import asyncio as _asyncio
 
-        urls = [f'https://raw.githubusercontent.com/{repo}/{sha}/{path}']
+        raw_url = f'https://raw.githubusercontent.com/{repo}/{sha}/{path}'
+        last_error = None
+        for attempt in range(3):
+            try:
+                r = await self.client.get(raw_url, timeout=120)
+                if r.status_code == 200 and r.content:
+                    self.log.debug(f'下载成功: {path} (来自 raw.githubusercontent.com)')
+                    return r.content
+                if r.status_code == 404:
+                    # 文件确实不存在，重试没有意义
+                    self.log.debug(f'raw.githubusercontent.com 返回 404: {path}')
+                    break
+                self.log.debug(f'raw.githubusercontent.com 返回 {r.status_code}: {path}')
+                last_error = f'HTTP{r.status_code}'
+            except Exception as e:
+                last_error = f'{type(e).__name__}'
+                self.log.debug(f'raw.githubusercontent.com 请求失败（第 {attempt + 1}/3 次）: {path} - {type(e).__name__}')
+            if attempt < 2:
+                await _asyncio.sleep(1.5 * (attempt + 1))
+
         if os.environ.get('IS_CN') == 'yes':
             urls = [
-                f'https://raw.githubusercontent.com/{repo}/{sha}/{path}',
                 f'https://gh-proxy.org/https://github.com/{repo}/{sha}/{path}',
                 f'https://cdn.gh-proxy.org/https://github.com/{repo}/{sha}/{path}',
                 f'https://edgeone.gh-proxy.org/https://github.com/{repo}/{sha}/{path}',
@@ -2377,29 +2400,29 @@ class CaiBackend:
                 f'https://gh.akass.cn/{repo}/{sha}/{path}',
             ]
 
-        async def fetch(url):
+            async def fetch(url):
+                try:
+                    r = await self.client.get(url, timeout=60)
+                    if r.status_code == 200 and r.content:
+                        return url, r.content
+                    self.log.debug(f'镜像 {url.split("/")[2]} 返回 {r.status_code}: {path}')
+                except Exception as e:
+                    self.log.debug(f'镜像 {url.split("/")[2]} 请求失败: {path} - {type(e).__name__}')
+                return url, None
+
+            tasks = [_asyncio.create_task(fetch(u)) for u in urls]
             try:
-                r = await self.client.get(url, timeout=25)
-                if r.status_code == 200 and r.content:
-                    return url, r.content
-                self.log.debug(f'镜像 {url.split("/")[2]} 返回 {r.status_code}: {path}')
-            except Exception as e:
-                self.log.debug(f'镜像 {url.split("/")[2]} 请求失败: {path} - {type(e).__name__}')
-            return url, None
+                for finished in _asyncio.as_completed(tasks):
+                    url, content = await finished
+                    if content:
+                        self.log.debug(f'下载成功: {path} (来自 {url.split("/")[2]})')
+                        return content
+            finally:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
 
-        tasks = [_asyncio.create_task(fetch(u)) for u in urls]
-        try:
-            for finished in _asyncio.as_completed(tasks):
-                url, content = await finished
-                if content:
-                    self.log.debug(f'下载成功: {path} (来自 {url.split("/")[2]})')
-                    return content
-        finally:
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-
-        raise Exception(f'所有镜像均无法下载文件: {path}')
+        raise Exception(f'所有镜像均无法下载文件: {path}（最后错误: {last_error}）')
 
     async def greenluma_add(self, depot_id_list: list) -> bool:
         app_list_path = self.steam_path / 'AppList'
@@ -2439,14 +2462,23 @@ class CaiBackend:
         return [
             {
                 "depot_id": depot_id,
+                "manifest_id": manifest_id,
                 "size": size,
                 "dlc_appid": source.split(':')[1] if source.startswith('DLC:') else None
             }
             for depot_id, manifest_id, size, source in depot_tuples
         ]
 
-    async def _add_free_dlcs_to_lua(self, app_id: str, lua_filepath: Path):
-        self.log.info(f"开始为 AppID {app_id} 查找无密钥/无Depot的DLC...")
+    async def _add_free_dlcs_to_lua(self, app_id: str, lua_filepath: Path, use_st_auto_update: bool = False):
+        """把 AppID 的所有 DLC 补进解锁文件。
+
+        分两类处理：
+          - 无 depot 的 DLC（多为免费内容）：只需 addappid(dlc_id)。
+          - 有独立 depot 的 DLC（付费服装包、资料片等）：需要 addappid(dlc_id) +
+            各 depot 的 addappid(depot, 1, "key")，密钥库里查不到 key 的跳过。
+        只按「有无 depot」筛选会让所有付费 DLC 都进不来，这是之前的漏项。
+        """
+        self.log.info(f"开始为 AppID {app_id} 查找可入库的 DLC...")
         try:
             all_dlc_ids = await self._get_dlc_ids(app_id)
             if not all_dlc_ids:
@@ -2464,10 +2496,42 @@ class CaiBackend:
             tasks = [_depots_limited(dlc_id) for dlc_id in all_dlc_ids]
             results = await asyncio.gather(*tasks)
 
-            depot_less_dlc_ids = [dlc_id for dlc_id, dlc_depots in zip(all_dlc_ids, results) if not dlc_depots]
-            
-            if not depot_less_dlc_ids:
-                self.log.info(f"未找到适用于 AppID {app_id} 的无密钥/无Depot的DLC。")
+            # 有 depot 的 DLC 需要密钥，先取一次密钥库（命中缓存时几乎不耗时）
+            key_db: Dict[str, str] = {}
+            if any(results):
+                key_db = await self._get_cached_sudama_data()
+
+            # 逐个别组装要写入的行
+            pending: Dict[str, List[str]] = {}
+            skipped_no_key: List[str] = []
+            for dlc_id, dlc_depots in zip(all_dlc_ids, results):
+                lines_for_dlc = [f"addappid({dlc_id})"]
+                if dlc_depots:
+                    matched = 0
+                    for depot in dlc_depots:
+                        depot_id = str(depot.get("depot_id") or "")
+                        if not depot_id:
+                            continue
+                        key = key_db.get(depot_id, "")
+                        if not key:
+                            continue
+                        lines_for_dlc.append(f'addappid({depot_id}, 1, "{key}")')
+                        manifest_id = str(depot.get("manifest_id") or "")
+                        if manifest_id:
+                            line = f'setManifestid({depot_id}, "{manifest_id}")'
+                            lines_for_dlc.append(f"--{line}" if use_st_auto_update else line)
+                        matched += 1
+                    if not matched:
+                        # 有 depot 但密钥库一个都没有，加了也解不开，留 debug 不刷屏
+                        skipped_no_key.append(dlc_id)
+                        continue
+                pending[dlc_id] = lines_for_dlc
+
+            if skipped_no_key:
+                self.log.debug(f"密钥库未覆盖以下 DLC 的 depot，已跳过: {', '.join(skipped_no_key)}")
+
+            if not pending:
+                self.log.info(f"AppID {app_id} 的 DLC 均无法入库（密钥库无对应 depotkey）。")
                 return
 
             async with self.lock:
@@ -2477,19 +2541,17 @@ class CaiBackend:
 
                 async with aiofiles.open(lua_filepath, 'r', encoding='utf-8') as f:
                     existing_lines = [line.strip() for line in await f.readlines() if line.strip()]
-                
+
                 existing_appids = {match.group(1) for line in existing_lines if (match := re.search(r'addappid\((\d+)', line))}
-                new_dlcs_to_add = [dlc_id for dlc_id in depot_less_dlc_ids if dlc_id not in existing_appids]
-                
+                new_dlcs_to_add = [dlc_id for dlc_id in pending if dlc_id not in existing_appids]
+
                 if not new_dlcs_to_add:
-                    self.log.info(f"所有找到的无Depot DLC均已存在于解锁文件中。无需添加。")
+                    self.log.info("所有找到的 DLC 均已存在于解锁文件中，无需添加。")
                     return
 
-                self.log.info(f"找到 {len(new_dlcs_to_add)} 个新的无密钥/无Depot DLC，正在合并到 LUA 文件...")
-                self.log.debug(f"新增 DLC: {', '.join(new_dlcs_to_add)}")
-
                 final_lines = set(existing_lines)
-                for dlc_id in new_dlcs_to_add: final_lines.add(f"addappid({dlc_id})")
+                for dlc_id in new_dlcs_to_add:
+                    final_lines.update(pending[dlc_id])
 
                 def sort_key(line):
                     match_add = re.search(r'addappid\((\d+)', line)
@@ -2497,16 +2559,20 @@ class CaiBackend:
                     match_set = re.search(r'setManifestid\((\d+)', line)
                     if match_set: return (1, int(match_set.group(1)))
                     return (2, line)
-                
-                sorted_lines = sorted(list(final_lines), key=sort_key)
+
+                sorted_lines = sorted(final_lines, key=sort_key)
 
                 async with aiofiles.open(lua_filepath, 'w', encoding='utf-8') as f:
                     await f.write('\n'.join(sorted_lines) + '\n')
-            
-            self.log.info(f"成功将 {len(new_dlcs_to_add)} 个新的无密钥/无Depot DLC合并到 {lua_filepath.name}")
+
+            with_key = sum(1 for d in new_dlcs_to_add if any('addappid(' in l and ',' in l for l in pending[d]))
+            self.log.info(
+                f"已合并 {len(new_dlcs_to_add)} 个 DLC 到 {lua_filepath.name}"
+                f"（其中 {with_key} 个带独立 depot 与密钥）"
+            )
 
         except Exception as e:
-            self.log.error(f"添加无密钥DLC时出错: {self.stack_error(e)}")
+            self.log.error(f"添加 DLC 时出错: {self.stack_error(e)}")
 
     # MODIFIED: Added patch_depot_key parameter
     async def _process_zip_manifest_generic(self, app_id: str, download_url: str, source_name: str, unlocker_type: str, use_st_auto_update: bool, add_all_dlc: bool, patch_depot_key: bool = False) -> bool:
@@ -2572,7 +2638,7 @@ class CaiBackend:
                 self.log.info(f"已为 {tool_label} 生成解锁文件: {lua_filepath}")
 
                 if add_all_dlc:
-                    await self._add_free_dlcs_to_lua(app_id, lua_filepath)
+                    await self._add_free_dlcs_to_lua(app_id, lua_filepath, use_st_auto_update)
 
                 # NEW: Apply depotkey patch if requested
                 if patch_depot_key:
@@ -2698,7 +2764,7 @@ class CaiBackend:
                 self.log.info(f"已为{tool_label}生成解锁文件: {lua_filepath}")
 
                 if add_all_dlc:
-                    await self._add_free_dlcs_to_lua(app_id, lua_filepath)
+                    await self._add_free_dlcs_to_lua(app_id, lua_filepath, use_st_auto_update)
                 if patch_depot_key:
                     self.log.info("开始修补创意工坊depotkey...")
                     await self.patch_lua_with_depotkey(app_id, lua_filepath)
@@ -2876,7 +2942,7 @@ class CaiBackend:
                         (dest / name).write_bytes(blob)
 
                 if add_all_dlc:
-                    await self._add_free_dlcs_to_lua(app_id, lua_filepath)
+                    await self._add_free_dlcs_to_lua(app_id, lua_filepath, use_st_auto_update)
                 if patch_depot_key:
                     await self.patch_lua_with_depotkey(app_id, lua_filepath)
             else:
@@ -3103,7 +3169,7 @@ class CaiBackend:
                 self.log.info(f"已为{tool_label}生成解锁文件: {lua_filepath}")
 
                 if add_all_dlc:
-                    await self._add_free_dlcs_to_lua(app_id, lua_filepath)
+                    await self._add_free_dlcs_to_lua(app_id, lua_filepath, use_st_auto_update)
 
                 if patch_depot_key:
                     self.log.info("开始修补创意工坊depotkey...")
@@ -3167,7 +3233,15 @@ class CaiBackend:
         try:
             downloaded_files = {}
             if files_to_download:
-                tasks = [self._get_from_mirrors(sha, item['path'], repo) for item in files_to_download]
+                # 逐个文件下载时给个并发上限：一次性把十几二十个文件全发出去，
+                # raw.githubusercontent.com 会按速率限流，表现是每次随机某个文件失败。
+                dl_sem = asyncio.Semaphore(4)
+
+                async def _fetch_one(item):
+                    async with dl_sem:
+                        return await self._get_from_mirrors(sha, item['path'], repo)
+
+                tasks = [_fetch_one(item) for item in files_to_download]
                 downloaded_contents = await asyncio.gather(*tasks)
                 downloaded_files = {item['path']: content for item, content in zip(files_to_download, downloaded_contents)}
         except Exception as e:
@@ -3238,7 +3312,7 @@ class CaiBackend:
             self.log.info(f"已为 {unlocker_type.capitalize()} 生成解锁文件: {app_id}.lua")
             
             if add_all_dlc:
-                await self._add_free_dlcs_to_lua(app_id, lua_filepath)
+                await self._add_free_dlcs_to_lua(app_id, lua_filepath, use_st_auto_update)
 
             # NEW: Apply depotkey patch if requested
             if patch_depot_key:

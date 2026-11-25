@@ -429,7 +429,10 @@ def start_task():
             TASK_STATE["result"] = {"success": False, "message": message}
             dummy_backend = CaiBackend()
             patch_log_for_socketio(dummy_backend.log)
-            dummy_backend.log.error(dummy_backend.stack_error(e))
+            # 具体失败原因在流程里已经各自记过一次，这里只补一行终止说明；
+            # 完整调用栈归 debug，正常使用时不必看到。
+            dummy_backend.log.error(f"任务终止: {e}")
+            dummy_backend.log.debug(dummy_backend.stack_error(e))
         finally:
             if TASK_STATE["status"] == "running":
                 TASK_STATE["status"] = "error"
@@ -468,7 +471,10 @@ def start_workshop_task():
             TASK_STATE["result"] = {"success": False, "message": message}
             dummy_backend = CaiBackend()
             patch_log_for_socketio(dummy_backend.log)
-            dummy_backend.log.error(dummy_backend.stack_error(e))
+            # 具体失败原因在流程里已经各自记过一次，这里只补一行终止说明；
+            # 完整调用栈归 debug，正常使用时不必看到。
+            dummy_backend.log.error(f"任务终止: {e}")
+            dummy_backend.log.debug(dummy_backend.stack_error(e))
         finally:
             if TASK_STATE["status"] == "running":
                 TASK_STATE["status"] = "error"

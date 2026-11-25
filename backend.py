@@ -1030,50 +1030,54 @@ class CaiBackend:
 
     # NEW: HTTP helper function for safe requests with retry mechanism
     async def http_get_safe(self, url: str, timeout: int = 30, max_retries: int = 3, retry_delay: float = 1.0) -> httpx.Response | None:
-        """安全的HTTP GET请求，带错误处理和重试机制"""
+        """安全的HTTP GET请求，带错误处理和重试机制。
+
+        中间失败只记 debug：调用方在最终拿不到数据时会自己记一条可读的 warning，
+        这里再逐次记 warning/error 只会把日志灌满重试细节，反而看不到真正的结果。
+        """
         last_exception = None
-        
+
         for attempt in range(max_retries):
             try:
                 # Use different timeout strategies for different attempts
                 current_timeout = timeout if attempt == 0 else min(timeout * (attempt + 1), 60)
-                
+
                 response = await self.client.get(url, timeout=current_timeout)
                 if response.status_code == 200:
                     if attempt > 0:  # Log successful retry
                         self.log.info(f"HTTP请求在第 {attempt + 1} 次尝试后成功: {url}")
                     return response
                 else:
-                    self.log.warning(f"HTTP请求失败，状态码: {response.status_code} - {url} (尝试 {attempt + 1}/{max_retries})")
+                    self.log.debug(f"HTTP请求失败，状态码: {response.status_code} - {url} (尝试 {attempt + 1}/{max_retries})")
                     if response.status_code in [429, 503, 502, 504]:  # Retry on server errors
                         if attempt < max_retries - 1:
                             await asyncio.sleep(retry_delay * (attempt + 1))
                             continue
                     return None
-                    
+
             except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TimeoutException) as e:
                 last_exception = e
-                self.log.warning(f"HTTP请求超时: {url} (尝试 {attempt + 1}/{max_retries}) - {e}")
+                self.log.debug(f"HTTP请求超时: {url} (尝试 {attempt + 1}/{max_retries}) - {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay * (attempt + 1))
                     continue
-                    
+
             except (httpx.ConnectError, httpx.RemoteProtocolError) as e:
                 last_exception = e
-                self.log.warning(f"HTTP连接错误: {url} (尝试 {attempt + 1}/{max_retries}) - {e}")
+                self.log.debug(f"HTTP连接错误: {url} (尝试 {attempt + 1}/{max_retries}) - {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay * (attempt + 1))
                     continue
-                    
+
             except Exception as e:
                 last_exception = e
-                self.log.error(f"HTTP请求异常: {url} (尝试 {attempt + 1}/{max_retries}) - {e}")
+                self.log.debug(f"HTTP请求异常: {url} (尝试 {attempt + 1}/{max_retries}) - {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay * (attempt + 1))
                     continue
                 break
-        
-        self.log.error(f"HTTP请求在 {max_retries} 次尝试后仍然失败: {url} - 最后异常: {last_exception}")
+
+        self.log.debug(f"HTTP请求在 {max_retries} 次尝试后仍然失败: {url} - 最后异常: {last_exception}")
         return None
 
     # NEW: Updated DLC retrieval function with better error handling
@@ -1106,7 +1110,7 @@ class CaiBackend:
             except Exception as e:
                 self.log.warning(f"解析 ddxnb源 响应失败: {e}")
         else:
-            self.log.warning(f"无法从 ddxnb源 获取 AppID {appid} 的数据")
+            self.log.debug(f"无法从 ddxnb源 获取 AppID {appid} 的数据")
 
         # 2. 尝试 SteamCMD API (原源)
         self.log.debug(f"尝试从 SteamCMD API 获取 AppID {appid} 的DLC...")
@@ -1192,7 +1196,7 @@ class CaiBackend:
             except Exception as e:
                 self.log.warning(f"解析 ddxnb源 Depot 信息失败: {e}")
         else:
-            self.log.warning(f"无法从 ddxnb源 获取 AppID {appid} 的Depot数据")
+            self.log.debug(f"无法从 ddxnb源 获取 AppID {appid} 的Depot数据")
 
         # 2. 尝试 SteamCMD API (原源)
         self.log.debug(f"尝试从 SteamCMD API 获取 AppID {appid} 的Depot...")
@@ -1206,7 +1210,7 @@ class CaiBackend:
             except Exception as e:
                 self.log.warning(f"解析 SteamCMD API Depot 信息失败: {e}")
         else:
-            self.log.warning(f"无法从 SteamCMD API 获取 AppID {appid} 的Depot数据")
+            self.log.debug(f"无法从 SteamCMD API 获取 AppID {appid} 的Depot数据")
         
         # 3. 降级：使用官方 API (兜底)
         self.log.debug(f"尝试从 Steam 官方 API 获取 AppID {appid} 的Depot...")
@@ -2354,19 +2358,48 @@ class CaiBackend:
             return False
 
     async def _get_from_mirrors(self, sha: str, path: str, repo: str) -> bytes:
+        """并发向所有镜像取同一个文件，取最先返回 200 的那个。
+
+        串行尝试的问题很实际：镜像列表里前面几个常年超时，等轮到能用的那个时
+        已经过去几十秒，甚至整体超时失败。并发后总耗时约等于最快可用镜像的响应时间。
+        """
+        import asyncio as _asyncio
+
         urls = [f'https://raw.githubusercontent.com/{repo}/{sha}/{path}']
         if os.environ.get('IS_CN') == 'yes':
-            urls = [f'https://gh-proxy.org/https://github.com/{repo}/{sha}/{path}',f'https://cdn.gh-proxy.org/https://github.com/{repo}/{sha}/{path}',f'https://edgeone.gh-proxy.org/https://github.com/{repo}/{sha}/{path}',f'https://github.chenc.dev/github.com/{repo}/{sha}/{path}',f'https://fastgit.cc/https://github.com/{repo}/{sha}/{path}',f'https://gh.llkk.cc/https://github.com/{repo}/{sha}/{path}',f'https://gh.akass.cn/{repo}/{sha}/{path}',f'https://raw.githubusercontent.com/{repo}/{sha}/{path}']
-        # 逐个镜像尝试，失败原因只在调试模式下逐条输出，成功后不再重复刷屏
-        for url in urls:
+            urls = [
+                f'https://raw.githubusercontent.com/{repo}/{sha}/{path}',
+                f'https://gh-proxy.org/https://github.com/{repo}/{sha}/{path}',
+                f'https://cdn.gh-proxy.org/https://github.com/{repo}/{sha}/{path}',
+                f'https://edgeone.gh-proxy.org/https://github.com/{repo}/{sha}/{path}',
+                f'https://github.chenc.dev/github.com/{repo}/{sha}/{path}',
+                f'https://fastgit.cc/https://github.com/{repo}/{sha}/{path}',
+                f'https://gh.llkk.cc/https://github.com/{repo}/{sha}/{path}',
+                f'https://gh.akass.cn/{repo}/{sha}/{path}',
+            ]
+
+        async def fetch(url):
             try:
-                r = await self.client.get(url, timeout=30)
-                if r.status_code == 200:
-                    self.log.debug(f'下载成功: {path} (来自 {url.split("/")[2]})')
-                    return r.content
+                r = await self.client.get(url, timeout=25)
+                if r.status_code == 200 and r.content:
+                    return url, r.content
                 self.log.debug(f'镜像 {url.split("/")[2]} 返回 {r.status_code}: {path}')
-            except httpx.RequestError as e:
-                self.log.debug(f'镜像 {url.split("/")[2]} 请求失败: {path} - {e}')
+            except Exception as e:
+                self.log.debug(f'镜像 {url.split("/")[2]} 请求失败: {path} - {type(e).__name__}')
+            return url, None
+
+        tasks = [_asyncio.create_task(fetch(u)) for u in urls]
+        try:
+            for finished in _asyncio.as_completed(tasks):
+                url, content = await finished
+                if content:
+                    self.log.debug(f'下载成功: {path} (来自 {url.split("/")[2]})')
+                    return content
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
         raise Exception(f'所有镜像均无法下载文件: {path}')
 
     async def greenluma_add(self, depot_id_list: list) -> bool:
@@ -2747,16 +2780,26 @@ class CaiBackend:
         return await self._process_zip_manifest_generic(app_id, download_url, source_name, unlocker_type, use_st_auto_update, add_all_dlc, patch_depot_key)
 
     async def fetch_branch_info(self, url: str, headers: Dict) -> Dict | None:
+        """取 GitHub API 的 JSON。
+
+        404 表示该仓库没有这个分支，属于正常情况，不打日志；
+        网络类异常多半是瞬时断连，记一行 warning 足够，不必把整段 traceback 写进日志。
+        """
         try:
-            r = await self.client.get(url, headers=headers)
+            r = await self.client.get(url, headers=headers, timeout=30)
             r.raise_for_status()
             return r.json()
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 403: self.log.error("GitHub API请求次数已用尽。")
-            elif e.response.status_code != 404: self.log.error(f"从 {url} 获取信息失败: {self.stack_error(e)}")
+            code = e.response.status_code
+            if code == 403:
+                self.log.warning("GitHub API 请求次数已用尽。")
+            elif code == 429:
+                self.log.warning("GitHub API 触发限流，稍后再试。")
+            elif code != 404:
+                self.log.warning(f"GitHub API 返回 {code}: {url}")
             return None
         except Exception as e:
-            self.log.error(f'从 {url} 获取信息时发生意外错误: {self.stack_error(e)}')
+            self.log.debug(f'取 {url} 失败: {type(e).__name__}: {e}')
             return None
             
     # MODIFIED: Updated to use all github repos including custom ones
@@ -2797,12 +2840,13 @@ class CaiBackend:
             self.log.info(f"正在通过 codeload 拉取 {repo} 分支 {app_id} ...")
             resp = await self.client.get(codeload_url, timeout=180, follow_redirects=True)
             if resp.status_code != 200:
-                self.log.error(f"codeload 拉取失败: HTTP{resp.status_code}。如果该清单在 {repo} 中不存在分支 {app_id}，这是正常现象。")
+                self.log.debug(f"codeload 拉取失败: HTTP{resp.status_code}。{repo} 中可能没有分支 {app_id}。")
                 return False
 
             if not zipfile.is_zipfile(_io.BytesIO(resp.content)):
-                self.log.error(f"codeload 返回的内容不是有效的 zip（{len(resp.content)} 字节），该分支可能不存在。")
+                self.log.warning(f"codeload 返回的内容不是 zip（{len(resp.content)} 字节），{repo} 的分支 {app_id} 可能不存在。")
                 return False
+
 
             zf = zipfile.ZipFile(_io.BytesIO(resp.content))
             names = zf.namelist()
@@ -3057,67 +3101,69 @@ class CaiBackend:
     async def find_appid_by_name(self, game_name: str) -> List[Dict]:
         """按名称搜索游戏，返回 [{appid, name, header_image}]。
 
-        使用 Steam 商店的 storesearch 接口，中英文都能命中；先按简体中文区搜一次，
-        结果为空时再按英文搜一次，覆盖只登记了英文名的作品。
+        使用 Steam 商店的 storesearch 接口，把接口返回的条目原样全部交给前端展示，
+        由使用者自己认领正确的那一条。先按简体中文区搜一次，为空时再按英文搜一次，
+        覆盖只登记了英文名的作品。
         """
         game_name = (game_name or "").strip()
         if not game_name:
             return []
-
-        # 直接输入 AppID 时不必走搜索
-        if game_name.isdigit():
-            name = await self._fetch_game_name_for_manager(game_name)
-            return [{'appid': game_name, 'name': name or game_name, 'header_image': ''}]
 
         self.log.info(f"正在尝试搜索游戏: {game_name}")
 
         url = 'https://store.steampowered.com/api/storesearch/'
         headers = {'User-Agent': 'Mozilla/5.0'}
 
+        games_list: List[Dict] = []
         try:
             for lang, cc in (('schinese', 'cn'), ('english', 'us')):
-                try:
-                    r = await self.client.get(
-                        url,
-                        params={'term': game_name, 'l': lang, 'cc': cc},
-                        headers=headers,
-                        timeout=20,
-                    )
-                    if r.status_code == 403:
-                        self.log.warning("搜索接口被拦截 (403)，请稍后重试。")
+                # 商店搜索接口偶发超时，每个语言各给两次机会
+                for attempt in range(2):
+                    try:
+                        r = await self.client.get(
+                            url,
+                            params={'term': game_name, 'l': lang, 'cc': cc},
+                            headers=headers,
+                            timeout=20,
+                        )
+                        if r.status_code == 403:
+                            self.log.warning("搜索接口被拦截 (403)，请稍后重试。")
+                            break
+                        r.raise_for_status()
+                        payload = r.json()
+                    except Exception as e:
+                        self.log.debug(f"storesearch({lang}) 第 {attempt + 1} 次请求失败: {type(e).__name__}")
                         continue
-                    r.raise_for_status()
-                    payload = r.json()
-                except Exception as e:
-                    self.log.debug(f"storesearch({lang}) 请求失败: {type(e).__name__}")
-                    continue
 
-                items = payload.get('items') if isinstance(payload, dict) else None
-                if not isinstance(items, list) or not items:
-                    continue
+                    items = payload.get('items') if isinstance(payload, dict) else None
+                    if not isinstance(items, list) or not items:
+                        break
 
-                games_list = []
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    appid = item.get('id')
-                    name = item.get('name')
-                    if appid and name:
-                        games_list.append({
-                            'appid': str(appid),
-                            'name': str(name),
-                            'header_image': item.get('tiny_image') or '',
-                        })
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        appid = item.get('id')
+                        name = item.get('name')
+                        if appid and name:
+                            games_list.append({
+                                'appid': str(appid),
+                                'name': str(name),
+                                'header_image': item.get('tiny_image') or '',
+                            })
+
+                    if games_list:
+                        break
 
                 if games_list:
-                    self.log.info(f"成功找到 {len(games_list)} 个结果")
-                    return games_list
-
-            self.log.warning("未找到相关游戏。")
+                    break
         except Exception as e:
             self.log.error(f"搜索游戏 '{game_name}' 失败: {self.stack_error(e)}")
 
-        return []
+        if games_list:
+            self.log.info(f"成功找到 {len(games_list)} 个结果")
+        else:
+            self.log.warning("未找到相关游戏。")
+        return games_list
 
     async def cleanup_temp_files(self):
         try:

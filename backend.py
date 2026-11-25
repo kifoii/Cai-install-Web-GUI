@@ -26,6 +26,14 @@ from urllib.parse import quote
 CURRENT_VERSION = "2.6"  # 当前版本号
 GITHUB_REPO = "kifoii/Cai-install-Web-GUI"
 
+# --- 失效源熔断 ---
+# steamui.com / steam.ddxnb.cn 目前对所有 AppID 恒返 403 或读超时，但单次调用仍要几十秒，
+# 且 get_dlc_ids_safe / get_depots_safe 会为每个 DLC 各调一次，累计能把一次入库拖到两分钟。
+# 这里记下失败过的主机：403/404 立即熔断，超时/连接错误累计两次熔断。
+_DEAD_HOSTS: Dict[str, float] = {}
+_DEAD_HOST_FAILS: Dict[str, int] = {}
+_DEAD_HOST_TTL = 600
+
 # --- OpenSteam(OpenSteamKitten) ---
 OPENSTEAM_EXE_NAME = "OpenSteamKitten.exe"      # OpenSteam 解锁工具可执行文件名
 OPENSTEAM_LUA_SUBDIR = "config/lua"             # OpenSteamKitten 的 lua 配置目录（相对 Steam 根目录）
@@ -1029,13 +1037,55 @@ class CaiBackend:
         return builtin_repos + custom_repos
 
     # NEW: HTTP helper function for safe requests with retry mechanism
+    @staticmethod
+    def _host_of(url: str) -> str:
+        try:
+            return url.split('//', 1)[1].split('/', 1)[0].lower()
+        except Exception:
+            return url
+
+    def _is_dead_host(self, url: str) -> bool:
+        """该主机近期返回过 403/404 时直接判定不可用，省掉一次超时等待。"""
+        host = self._host_of(url)
+        expired_at = _DEAD_HOSTS.get(host)
+        if expired_at is None:
+            return False
+        if time.time() > expired_at:
+            _DEAD_HOSTS.pop(host, None)
+            return False
+        return True
+
+    def _mark_dead_host(self, url: str) -> None:
+        host = self._host_of(url)
+        if host not in _DEAD_HOSTS:
+            self.log.debug(f"主机 {host} 近期不可用，{_DEAD_HOST_TTL} 秒内不再尝试。")
+        _DEAD_HOSTS[host] = time.time() + _DEAD_HOST_TTL
+
+    def _note_host_failure(self, url: str) -> None:
+        """超时/连接错误不是「死源」的确定证据（可能只是抖动），连错两次才熔断。
+
+        ddxnb 的失败形态是读超时（40~60 秒挂住不发数据），不会返回 403 状态码，
+        只靠状态码熔断对它无效，所以失败次数也要计入。
+        """
+        host = self._host_of(url)
+        count = _DEAD_HOST_FAILS.get(host, 0) + 1
+        _DEAD_HOST_FAILS[host] = count
+        if count >= 2:
+            self._mark_dead_host(url)
+
     async def http_get_safe(self, url: str, timeout: int = 30, max_retries: int = 3, retry_delay: float = 1.0) -> httpx.Response | None:
         """安全的HTTP GET请求，带错误处理和重试机制。
 
         中间失败只记 debug：调用方在最终拿不到数据时会自己记一条可读的 warning，
         这里再逐次记 warning/error 只会把日志灌满重试细节，反而看不到真正的结果。
+
+        403/404 会被记进 _DEAD_HOSTS 并在短时间内跳过，避免为每个 DLC 重复等同一个死源。
         """
         last_exception = None
+
+        if self._is_dead_host(url):
+            self.log.debug(f"跳过近期不可用的主机: {url}")
+            return None
 
         for attempt in range(max_retries):
             try:
@@ -1049,6 +1099,8 @@ class CaiBackend:
                     return response
                 else:
                     self.log.debug(f"HTTP请求失败，状态码: {response.status_code} - {url} (尝试 {attempt + 1}/{max_retries})")
+                    if response.status_code in (403, 404):
+                        self._mark_dead_host(url)
                     if response.status_code in [429, 503, 502, 504]:  # Retry on server errors
                         if attempt < max_retries - 1:
                             await asyncio.sleep(retry_delay * (attempt + 1))
@@ -1077,13 +1129,14 @@ class CaiBackend:
                     continue
                 break
 
+        self._note_host_failure(url)
         self.log.debug(f"HTTP请求在 {max_retries} 次尝试后仍然失败: {url} - 最后异常: {last_exception}")
         return None
 
     # NEW: Updated DLC retrieval function with better error handling
     async def get_dlc_ids_safe(self, appid: str) -> List[str]:
         """安全的DLC ID获取函数，支持多数据源回退 (ddxnb -> steamcmd -> steam store)"""
-        self.log.info(f"正在获取 AppID {appid} 的DLC信息...")
+        self.log.debug(f"正在获取 AppID {appid} 的DLC信息...")
 
         # 通用解析函数 (ddxnb 和 steamcmd 结构一致)
         def parse_steamcmd_style_json(json_data: dict) -> List[str]:
@@ -1097,22 +1150,7 @@ class CaiBackend:
                 pass
             return []
 
-        # 1. 尝试 ddxnb 源 (国内优化)
-        self.log.debug(f"尝试从 ddxnb源 获取 AppID {appid} 的DLC...")
-        data = await self.http_get_safe(f"https://steam.ddxnb.cn/v1/info/{appid}", timeout=20, max_retries=2)
-        if data:
-            try:
-                dlc_ids = parse_steamcmd_style_json(data.json())
-                if dlc_ids:
-                    self.log.info(f"从 ddxnb源 成功获取到 {len(dlc_ids)} 个DLC")
-                    return dlc_ids
-                self.log.debug(f"ddxnb源 中 AppID {appid} 没有DLC信息或解析为空")
-            except Exception as e:
-                self.log.warning(f"解析 ddxnb源 响应失败: {e}")
-        else:
-            self.log.debug(f"无法从 ddxnb源 获取 AppID {appid} 的数据")
-
-        # 2. 尝试 SteamCMD API (原源)
+        # 1. 尝试 SteamCMD API。它稳定可用（1~2 秒），所以放第一顺位
         self.log.debug(f"尝试从 SteamCMD API 获取 AppID {appid} 的DLC...")
         data = await self.http_get_safe(f"https://api.steamcmd.net/v1/info/{appid}", timeout=20, max_retries=2)
         if data:
@@ -1127,7 +1165,19 @@ class CaiBackend:
         else:
             self.log.warning(f"无法从 SteamCMD API 获取 AppID {appid} 的数据")
         
-        # 3. 降级：使用官方 API (兜底)
+        # 3. ddxnb 垫底：该源目前恒返 403 或读超时，放最后以免拖慢正常路径
+        self.log.debug(f"尝试从 ddxnb源 获取 AppID {appid} 的DLC...")
+        data = await self.http_get_safe(f"https://steam.ddxnb.cn/v1/info/{appid}", timeout=8, max_retries=1)
+        if data:
+            try:
+                dlc_ids = parse_steamcmd_style_json(data.json())
+                if dlc_ids:
+                    self.log.info(f"从 ddxnb源 成功获取到 {len(dlc_ids)} 个DLC")
+                    return dlc_ids
+            except Exception as e:
+                self.log.debug(f"解析 ddxnb源 响应失败: {e}")
+
+        # 4. 降级：使用官方 API (兜底)
         self.log.debug(f"尝试从 Steam 官方 API 获取 AppID {appid} 的DLC...")
         api_variants = [
             f"https://store.steampowered.com/api/appdetails?appids={appid}&l=schinese",
@@ -1157,7 +1207,7 @@ class CaiBackend:
     # NEW: Updated depot retrieval function with better error handling
     async def get_depots_safe(self, appid: str) -> List[Tuple[str, str, int, str]]:
         """安全的Depot获取函数，返回 (depot_id, manifest_id, size, source) 元组列表"""
-        self.log.info(f"正在获取 AppID {appid} 的Depot信息...")
+        self.log.debug(f"正在获取 AppID {appid} 的Depot信息...")
         
         # 通用解析函数 (适用于 ddxnb 和 steamcmd)
         def parse_steamcmd_style_depots(json_data: dict) -> List[Tuple[str, str, int, str]]:
@@ -1182,73 +1232,35 @@ class CaiBackend:
                 pass
             return out
 
-        # 1. 尝试 ddxnb 源 (国内优化)
-        self.log.debug(f"尝试从 ddxnb源 获取 AppID {appid} 的Depot...")
-        data = await self.http_get_safe(f"https://steam.ddxnb.cn/v1/info/{appid}", timeout=20, max_retries=2)
-        if data:
-            try:
-                out = parse_steamcmd_style_depots(data.json())
-                if out:
-                    self.log.info(f"从 ddxnb源 成功获取到 {len(out)} 个Depot")
-                    return out
-                if "data" in data.json():
-                     self.log.debug(f"ddxnb源 返回数据中无Depot信息")
-            except Exception as e:
-                self.log.warning(f"解析 ddxnb源 Depot 信息失败: {e}")
-        else:
-            self.log.debug(f"无法从 ddxnb源 获取 AppID {appid} 的Depot数据")
-
-        # 2. 尝试 SteamCMD API (原源)
+        # 1. 尝试 SteamCMD API。它稳定可用（1~2 秒），所以放第一顺位
         self.log.debug(f"尝试从 SteamCMD API 获取 AppID {appid} 的Depot...")
         data = await self.http_get_safe(f"https://api.steamcmd.net/v1/info/{appid}", timeout=20, max_retries=2)
         if data:
             try:
                 out = parse_steamcmd_style_depots(data.json())
                 if out:
-                    self.log.info(f"从 SteamCMD API 成功获取到 {len(out)} 个Depot")
+                    self.log.debug(f"从 SteamCMD API 成功获取到 {len(out)} 个Depot")
                     return out
             except Exception as e:
                 self.log.warning(f"解析 SteamCMD API Depot 信息失败: {e}")
         else:
             self.log.debug(f"无法从 SteamCMD API 获取 AppID {appid} 的Depot数据")
         
-        # 3. 降级：使用官方 API (兜底)
-        self.log.debug(f"尝试从 Steam 官方 API 获取 AppID {appid} 的Depot...")
-        api_variants = [
-            f"https://store.steampowered.com/api/appdetails?appids={appid}&l=schinese",
-            f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english",
-            f"https://store.steampowered.com/api/appdetails?appids={appid}"
-        ]
-        
-        for api_url in api_variants:
-            data = await self.http_get_safe(api_url, timeout=25, max_retries=2, retry_delay=2.0)
-            if data:
-                try:
-                    j = data.json()
-                    app_data = j.get(str(appid), {})
-                    if app_data.get("success") and "data" in app_data:
-                        depots = app_data["data"].get("depots", {})
-                        out = []
-                        for depot_id, depot_info in depots.items():
-                            if not isinstance(depot_info, dict): continue
-                            manifest_info = depot_info.get("manifests", {}).get("public")
-                            if not isinstance(manifest_info, dict): continue
-                            
-                            manifest_id = manifest_info.get("gid")
-                            size = int(manifest_info.get("download", 0))
-                            dlc_appid = depot_info.get("dlcappid")
-                            source_label = f"DLC:{dlc_appid}" if dlc_appid else "主游戏"
-                            
-                            if manifest_id:
-                                out.append((depot_id, manifest_id, size, source_label))
-                        if out:
-                            self.log.info(f"从 Steam 官方 API 成功获取到 {len(out)} 个Depot")
-                            return out
-                except Exception as e:
-                    self.log.warning(f"解析 Steam 官方 API Depot 信息失败 ({api_url}): {e}")
-                    continue
-        
-        self.log.info(f"未找到 AppID {appid} 的Depot信息（已尝试所有数据源）")
+        # 3. ddxnb 垫底：该源目前恒返 403 或读超时，放最后以免拖慢正常路径
+        self.log.debug(f"尝试从 ddxnb源 获取 AppID {appid} 的Depot...")
+        data = await self.http_get_safe(f"https://steam.ddxnb.cn/v1/info/{appid}", timeout=8, max_retries=1)
+        if data:
+            try:
+                out = parse_steamcmd_style_depots(data.json())
+                if out:
+                    self.log.debug(f"从 ddxnb源 成功获取到 {len(out)} 个Depot")
+                    return out
+            except Exception as e:
+                self.log.debug(f"解析 ddxnb源 Depot 信息失败: {e}")
+
+        # 不再尝试 store.steampowered.com/api/appdetails：该接口从不返回 depots 字段，
+        # 曾经在这里多打三次请求、白等十几秒。查不到就是查不到，直接返回空。
+        self.log.debug(f"未找到 AppID {appid} 的Depot信息（已尝试 SteamCMD API / steamui / ddxnb）")
         return []
 
     # Workshop-related methods
@@ -1866,8 +1878,10 @@ class CaiBackend:
 
     async def _get_depots_and_manifests_from_ddxnb(self, app_id: str) -> Dict[str, str]:
         """从备用API (steam.ddxnb.cn) 获取 depot 和对应的 manifest 信息"""
+        url = f"https://steam.ddxnb.cn/v1/info/{app_id}"
+        if self._is_dead_host(url):
+            return {}
         try:
-            url = f"https://steam.ddxnb.cn/v1/info/{app_id}"
             response = await self.client.get(url, timeout=20)
             response.raise_for_status()
 
@@ -1907,87 +1921,70 @@ class CaiBackend:
             return depot_manifest_map
 
         except Exception as e:
-            self.log.error(f"从备用API (steam.ddxnb.cn) 获取 depot 信息失败: {e}")
+            if isinstance(e, httpx.HTTPStatusError) and e.response is not None and e.response.status_code in (403, 404):
+                self._mark_dead_host(url)
+            self.log.debug(f"从备用API (steam.ddxnb.cn) 获取 depot 信息失败: {e}")
             return {}
 
+    def _parse_steamui_vdf(self, vdf_content: str) -> Dict[str, str]:
+        """解析 steamui.com 返回的 VDF，抽出 depot_id -> public manifest gid。"""
+        data = vdf.loads(vdf_content)
+        depot_manifest_map: Dict[str, str] = {}
+
+        def collect(container):
+            if not isinstance(container, dict):
+                return
+            for depot_id, depot_info in container.items():
+                if not str(depot_id).isdigit() or not isinstance(depot_info, dict):
+                    continue
+                public_manifest = (depot_info.get('manifests') or {}).get('public')
+                if isinstance(public_manifest, dict) and public_manifest.get('gid'):
+                    depot_manifest_map[str(depot_id)] = public_manifest['gid']
+
+        # 顶层直接是 depot 表，或嵌在 depots 下，或再包一层（三种历史结构都见过）
+        collect({k: v for k, v in data.items() if str(k).isdigit()})
+        if not depot_manifest_map and 'depots' in data:
+            collect(data['depots'])
+        if not depot_manifest_map:
+            for value in data.values():
+                if isinstance(value, dict) and 'depots' in value:
+                    collect(value['depots'])
+                    if depot_manifest_map:
+                        break
+        return depot_manifest_map
+
     async def _get_depots_and_manifests_from_steamui(self, app_id: str) -> Dict[str, str]:
-        """从 steamui API 获取 depot 和对应的 manifest 信息，失败时使用备用API"""
-        # 1. 尝试主API (steamui.com)
-        vdf_content = "" # Initialize to ensure it exists for logging on failure
-        try:
-            self.log.info(f"正从主API (steamui.com) 获取 AppID {app_id} 的信息...")
-            url = f"https://steamui.com/api/get_appinfo.php?appid={app_id}"
-            response = await self.client.get(url, timeout=20)
-            response.raise_for_status()
-            
-            vdf_content = response.text
-            
-            import vdf # Local import to avoid dependency issues if VDF is not always used
-            data = vdf.loads(vdf_content)
-            
-            depot_manifest_map = {}
-            
-            # First-level check for depots
-            for key, value in data.items():
-                if key.isdigit() and isinstance(value, dict):
-                    if 'manifests' in value and value['manifests']:
-                        manifests = value['manifests']
-                        if isinstance(manifests, dict) and 'public' in manifests:
-                            public_manifest = manifests['public']
-                            if isinstance(public_manifest, dict) and 'gid' in public_manifest:
-                                manifest_id = public_manifest['gid']
-                                depot_manifest_map[key] = manifest_id
-            
-            # Fallback checks for different VDF structures if first-level fails
-            if not depot_manifest_map:
-                if 'depots' in data:
-                    depots = data['depots']
-                    for depot_id, depot_info in depots.items():
-                        if depot_id.isdigit() and isinstance(depot_info, dict):
-                            if 'manifests' in depot_info and depot_info['manifests']:
-                                manifests = depot_info['manifests']
-                                if isinstance(manifests, dict) and 'public' in manifests:
-                                    public_manifest = manifests['public']
-                                    if isinstance(public_manifest, dict) and 'gid' in public_manifest:
-                                        manifest_id = public_manifest['gid']
-                                        depot_manifest_map[depot_id] = manifest_id
-                
-                if not depot_manifest_map:
-                    for key, value in data.items():
-                        if isinstance(value, dict) and 'depots' in value:
-                            depots = value['depots']
-                            for depot_id, depot_info in depots.items():
-                                if depot_id.isdigit() and isinstance(depot_info, dict):
-                                    if 'manifests' in depot_info and depot_info['manifests']:
-                                        manifests = depot_info['manifests']
-                                        if isinstance(manifests, dict) and 'public' in manifests:
-                                            public_manifest = manifests['public']
-                                            if isinstance(public_manifest, dict) and 'gid' in public_manifest:
-                                                manifest_id = public_manifest['gid']
-                                                depot_manifest_map[depot_id] = manifest_id
+        """按 api.steamcmd.net -> steamui.com -> steam.ddxnb.cn 顺序取 depot 与 manifest。
 
-            if depot_manifest_map:
-                self.log.info(f"从主API (steamui.com) 成功获取 {len(depot_manifest_map)} 个 depot。")
-                return depot_manifest_map
-            else:
-                # This case means the request was successful but no depots were found.
-                # We should raise an exception to trigger the fallback.
-                raise ValueError("主API响应成功，但未解析到任何depot信息，请检查APP ID是否正确或API请求问题")
-
-        except Exception as e:
-            self.log.warning(f"主API (steamui.com) 访问或解析失败: {e}。")
-            if vdf_content:
-                self.log.warning(f"主API返回内容预览: {vdf_content[:300]}...")
-            self.log.info("正在尝试备用API (steam.ddxnb.cn)...")
-
-        # 2. 如果主API失败，调用备用API
-        depot_manifest_map = await self._get_depots_and_manifests_from_ddxnb(app_id)
+        函数名沿用历史名（调用点较多），实际首选已改成 SteamCMD API：
+        steamui.com 与 steam.ddxnb.cn 目前恒返 403 或读超时，排在前面会让每个 AppID 白等十几秒。
+        失败过的主机会记入 _DEAD_HOSTS，后续 10 分钟内直接跳过。
+        """
+        depot_manifest_map = await self._get_depots_and_manifests_from_steamcmd(app_id)
         if depot_manifest_map:
             return depot_manifest_map
 
-        # 3. 备用API 也失败时，降级到 SteamCMD API（结构与 ddxnb 一致）
-        self.log.info("正在尝试 SteamCMD API (api.steamcmd.net)...")
-        return await self._get_depots_and_manifests_from_steamcmd(app_id)
+        url = f"https://steamui.com/api/get_appinfo.php?appid={app_id}"
+        if self._is_dead_host(url):
+            self.log.debug("主API (steamui.com) 近期不可用，跳过。")
+        else:
+            try:
+                self.log.debug(f"正从主API (steamui.com) 获取 AppID {app_id} 的信息...")
+                response = await self.client.get(url, timeout=8)
+                response.raise_for_status()
+                depot_manifest_map = self._parse_steamui_vdf(response.text)
+                if depot_manifest_map:
+                    self.log.info(f"从主API (steamui.com) 获取到 {len(depot_manifest_map)} 个 depot。")
+                    return depot_manifest_map
+                self.log.debug("主API 响应成功但未解析到 depot。")
+            except Exception as e:
+                if isinstance(e, httpx.HTTPStatusError) and e.response is not None and e.response.status_code in (403, 404):
+                    self._mark_dead_host(url)
+                else:
+                    self._note_host_failure(url)
+                self.log.debug(f"主API (steamui.com) 访问失败: {e}")
+
+        return await self._get_depots_and_manifests_from_ddxnb(app_id)
 
     async def _get_depots_and_manifests_from_steamcmd(self, app_id: str) -> Dict[str, str]:
         """从 SteamCMD API (api.steamcmd.net) 获取 depot 和对应的 manifest 信息。
@@ -2454,7 +2451,15 @@ class CaiBackend:
                 self.log.info(f"AppID {app_id} 未找到任何DLC。")
                 return
 
-            tasks = [self._get_depots(dlc_id) for dlc_id in all_dlc_ids]
+            # 并发查各 DLC 的 depot，但要限流：api.steamcmd.net 在 6 并发时单请求会拖到 4 秒，
+            # 限到 3 并发反而是最快的（实测 sem=1:2.48s / sem=2:1.53s / sem=3:2.11s / sem=6:4.24s）。
+            sem = asyncio.Semaphore(3)
+
+            async def _depots_limited(dlc_id: str):
+                async with sem:
+                    return await self._get_depots(dlc_id)
+
+            tasks = [_depots_limited(dlc_id) for dlc_id in all_dlc_ids]
             results = await asyncio.gather(*tasks)
 
             depot_less_dlc_ids = [dlc_id for dlc_id, dlc_depots in zip(all_dlc_ids, results) if not dlc_depots]
@@ -2479,6 +2484,7 @@ class CaiBackend:
                     return
 
                 self.log.info(f"找到 {len(new_dlcs_to_add)} 个新的无密钥/无Depot DLC，正在合并到 LUA 文件...")
+                self.log.debug(f"新增 DLC: {', '.join(new_dlcs_to_add)}")
 
                 final_lines = set(existing_lines)
                 for dlc_id in new_dlcs_to_add: final_lines.add(f"addappid({dlc_id})")

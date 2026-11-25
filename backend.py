@@ -3055,52 +3055,68 @@ class CaiBackend:
         return user_input if user_input.isdigit() else None
 
     async def find_appid_by_name(self, game_name: str) -> List[Dict]:
+        """按名称搜索游戏，返回 [{appid, name, header_image}]。
+
+        使用 Steam 商店的 storesearch 接口，中英文都能命中；先按简体中文区搜一次，
+        结果为空时再按英文搜一次，覆盖只登记了英文名的作品。
+        """
+        game_name = (game_name or "").strip()
+        if not game_name:
+            return []
+
+        # 直接输入 AppID 时不必走搜索
+        if game_name.isdigit():
+            name = await self._fetch_game_name_for_manager(game_name)
+            return [{'appid': game_name, 'name': name or game_name, 'header_image': ''}]
+
+        self.log.info(f"正在尝试搜索游戏: {game_name}")
+
+        url = 'https://store.steampowered.com/api/storesearch/'
+        headers = {'User-Agent': 'Mozilla/5.0'}
+
         try:
-            self.log.info(f"正在尝试搜索游戏: {game_name}")
-            
-            
-            # 发送请求
-            r = await self.client.get(url, params={'term': game_name}, headers=headers, timeout=20)
-            
-            if r.status_code == 403:
-                self.log.warning("API请求被拦截 (403 Forbidden)，可能是API鉴权失败或WAF拦截。")
-                return []
-            
-            r.raise_for_status()
-            
-            resp_json = r.json()
-            
-            # 解析 API 返回结构: {"status": "ok", "data": [{"appid":..., "name":...}, ...]}
-            raw_data = []
-            if isinstance(resp_json, dict):
-                # 检查状态或直接获取data
-                if resp_json.get("status") == "ok" or "data" in resp_json:
-                    raw_data = resp_json.get("data", [])
-            
-            games_list = []
-            if isinstance(raw_data, list):
-                for item in raw_data:
-                    appid = item.get('appid')
+            for lang, cc in (('schinese', 'cn'), ('english', 'us')):
+                try:
+                    r = await self.client.get(
+                        url,
+                        params={'term': game_name, 'l': lang, 'cc': cc},
+                        headers=headers,
+                        timeout=20,
+                    )
+                    if r.status_code == 403:
+                        self.log.warning("搜索接口被拦截 (403)，请稍后重试。")
+                        continue
+                    r.raise_for_status()
+                    payload = r.json()
+                except Exception as e:
+                    self.log.debug(f"storesearch({lang}) 请求失败: {type(e).__name__}")
+                    continue
+
+                items = payload.get('items') if isinstance(payload, dict) else None
+                if not isinstance(items, list) or not items:
+                    continue
+
+                games_list = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    appid = item.get('id')
                     name = item.get('name')
-                    image = item.get('image')
-                    
                     if appid and name:
-                        # 兼容 Web GUI 前端，将 image 映射为 header_image
                         games_list.append({
                             'appid': str(appid),
-                            'name': name,
-                            'header_image': image
+                            'name': str(name),
+                            'header_image': item.get('tiny_image') or '',
                         })
 
-            if games_list:
-                self.log.info(f"成功找到 {len(games_list)} 个结果")
-                return games_list
-            else:
-                self.log.warning("未找到相关游戏。")
-                
+                if games_list:
+                    self.log.info(f"成功找到 {len(games_list)} 个结果")
+                    return games_list
+
+            self.log.warning("未找到相关游戏。")
         except Exception as e:
             self.log.error(f"搜索游戏 '{game_name}' 失败: {self.stack_error(e)}")
-            
+
         return []
 
     async def cleanup_temp_files(self):

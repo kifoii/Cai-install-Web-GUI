@@ -330,7 +330,7 @@ class CaiWebApp {
         const numericAppId = appId.match(/\d+/)?.[0];
         if (numericAppId) {
             this.setImageState(false);
-            const imageUrl = `https://cdn.akamai.steamstatic.com/steam/apps/${numericAppId}/header.jpg`;
+            const imageUrl = `/api/cover/${numericAppId}`;
             const img = this.elements.gameHeaderImage;
             img.onload = () => this.setImageState(true);
             img.onerror = () => { this.setImageState(false); this.showSnackbar('无法加载游戏图片。', 'warning'); };

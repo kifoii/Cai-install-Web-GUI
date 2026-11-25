@@ -993,7 +993,7 @@ class CaiBackend:
                 if '{app_id}' in repo['url']:
                     validated_repos.append(repo)
                 else:
-                    self.log.warning(f"自定义ZIP仓库URL缺少{app_id}占位符: {repo}")
+                    self.log.warning(f"自定义ZIP仓库URL缺少{{app_id}}占位符: {repo}")
             else:
                 self.log.warning(f"无效的自定义ZIP仓库配置: {repo}")
         

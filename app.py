@@ -276,6 +276,7 @@ def get_sources():  # 改为同步函数
                     "Sudama库(仅密钥）": "sudama",
                     "清单不求人库（仅清单）": "buqiuren",
                     "steamtools.games": "steamtools_games",
+                    "steamhub": "steamhub",
                     "GitHub (Auiowu)": "Auiowu/ManifestAutoUpdate",
                     "GitHub (ManifestHub3)": "steamtools-games/ManifestHub3",
                     "GitHub (dc190)": "dc190/ManifestHub",
@@ -368,7 +369,7 @@ async def _run_unlock_task(app_id, tool_type, use_st_auto_update, add_all_dlc, p
         backend.log.info(f"--- 正在使用源 '{tool_type}' 处理 AppID: {app_id_extracted} ---")
         
         # 按 depot 直连下载的自有源，走 process_zip_source 而非 process_github_manifest
-        zip_sources = ["steamautocracks_v2", "sudama", "buqiuren", "steamtools_games"]
+        zip_sources = ["steamautocracks_v2", "sudama", "buqiuren", "steamtools_games", "steamhub"]
         
         # Check for custom zip sources
         if tool_type.startswith("custom_zip_"):

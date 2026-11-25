@@ -2740,6 +2740,168 @@ class CaiBackend:
             self.log.error(f"处理 steamtools.games 清单时出错: {self.stack_error(e)}")
             return False
 
+    async def process_steamhub_manifest(self, app_id: str, unlocker_type: str, use_st_auto_update: bool, add_all_dlc: bool = False, patch_depot_key: bool = False) -> bool:
+        """从 steamhub.156354.xyz 下载清单包。
+
+        接口（2026-11 实测可用）：
+          GET /api/games/{appid}                     -> data.download_token / file_size / name_cn
+          GET /api/games/{appid}/download?token=..   -> zip
+        zip 内是 <appid>.lua（成品，含 depotkey 与 setManifestid）、key.vdf 与各 .manifest，
+        结构与 Auiowu 的分支 zip 一致，所以复用同样的写入逻辑。
+        该站响应时间波动较大（1s ~ 30s），失败时按次重试。
+        """
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+        async def _get(url: str, timeout: int = 60, tries: int = 3):
+            last = None
+            for i in range(tries):
+                try:
+                    return await self.client.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+                except Exception as e:
+                    last = e
+                    if i < tries - 1:
+                        await asyncio.sleep(1.5 * (i + 1))
+            raise last
+
+        try:
+            self.log.info(f"正从 steamhub 处理 AppID {app_id} 的清单...")
+
+            # 1. 取下载令牌
+            info_resp = await _get(f"https://steamhub.156354.xyz/api/games/{app_id}")
+            if info_resp.status_code == 404:
+                self.log.warning(f"steamhub 中未收录 AppID {app_id}")
+                return False
+            if info_resp.status_code != 200:
+                self.log.error(f"steamhub 查询失败，HTTP{info_resp.status_code}")
+                return False
+
+            payload = info_resp.json()
+            info = payload.get("data") or {}
+            token = info.get("download_token")
+            if not token:
+                self.log.warning(f"steamhub 未返回下载令牌: {payload.get('message', '未知原因')}")
+                return False
+
+            game_name = info.get("name_cn") or info.get("name") or ""
+            if game_name:
+                self.log.info(f"steamhub 命中: {game_name}")
+
+            # 2. 下载清单包
+            zip_resp = await _get(
+                f"https://steamhub.156354.xyz/api/games/{app_id}/download?token={token}",
+                timeout=180, tries=2,
+            )
+            if zip_resp.status_code != 200:
+                self.log.error(f"steamhub 下载失败，HTTP{zip_resp.status_code}")
+                return False
+            if not zipfile.is_zipfile(io.BytesIO(zip_resp.content)):
+                self.log.error(f"steamhub 返回的内容不是 zip（{len(zip_resp.content)} 字节）。")
+                return False
+
+            with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+                names = zf.namelist()
+                lua_in_zip = next((n for n in names if n.lower().endswith(f"{app_id}.lua")), None)
+                key_vdf_in_zip = next((n for n in names if n.lower().endswith("key.vdf")), None)
+                manifest_names = [n for n in names if n.lower().endswith(".manifest")]
+
+                depot_keys = {}
+                if key_vdf_in_zip:
+                    try:
+                        parsed = vdf.loads(zf.read(key_vdf_in_zip).decode("utf-8", errors="ignore"))
+                        for depot_id, depot_info in (parsed.get("depots") or {}).items():
+                            if isinstance(depot_info, dict) and depot_info.get("DecryptionKey"):
+                                depot_keys[str(depot_id)] = str(depot_info["DecryptionKey"])
+                    except Exception as e:
+                        self.log.warning(f"解析 key.vdf 失败（不影响主流程）: {e}")
+
+                lua_text = ""
+                if lua_in_zip:
+                    lua_text = zf.read(lua_in_zip).decode("utf-8", errors="ignore")
+
+                manifest_blobs = {Path(n).name: zf.read(n) for n in manifest_names}
+
+            if not lua_text and not depot_keys and not manifest_blobs:
+                self.log.error("steamhub 的清单包里没有可用内容。")
+                return False
+
+            # 3. 写入
+            if self._is_lua_unlocker(unlocker_type):
+                lua_dir = self._lua_write_dir(unlocker_type)
+                lua_dir.mkdir(parents=True, exist_ok=True)
+                lua_filepath = lua_dir / f"{app_id}.lua"
+
+                if lua_text:
+                    # 自动更新模式要把 setManifestid 注释掉，让解锁工具自己去取最新清单；
+                    # 站方给的 lua 是固定版本（setManifestid 全启用），这里按模式改。
+                    if use_st_auto_update:
+                        lua_text = re.sub(
+                            r'^(?!\s*--)(\s*)setManifestid',
+                            r'\1--setManifestid',
+                            lua_text,
+                            flags=re.MULTILINE,
+                        )
+                    lines = [lua_text.rstrip("\n")]
+                    existing = set(re.findall(r'addappid\(\s*(\d+)\s*,', lua_text))
+                else:
+                    # 包里没成品 lua 时自行拼一份：addappid 带密钥 + setManifestid
+                    lines = [f"addappid({app_id})"]
+                    existing = set()
+                    for depot_id, key in depot_keys.items():
+                        lines.append(f'addappid({depot_id}, 1, "{key}")')
+                        existing.add(depot_id)
+
+                # key.vdf 里多出来的 depot 补进去
+                for depot_id, key in depot_keys.items():
+                    if depot_id not in existing and depot_id != str(app_id):
+                        lines.append(f'addappid({depot_id}, 1, "{key}")')
+
+                # 包里没有 lua 时用 manifest 文件名补 setManifestid
+                if not lua_text:
+                    for name in manifest_blobs:
+                        m = re.match(r'(\d+)_(\w+)\.manifest$', name)
+                        if m:
+                            line = f'setManifestid({m.group(1)}, "{m.group(2)}")'
+                            lines.append(f"--{line}" if use_st_auto_update else line)
+
+                async with aiofiles.open(lua_filepath, mode="w", encoding="utf-8") as f:
+                    await f.write("\n".join(lines) + "\n")
+
+                tool_label = "OpenSteam" if unlocker_type == "opensteam" else "SteamTools"
+                self.log.info(f"已为{tool_label}生成解锁文件: {lua_filepath}")
+
+                # 清单文件同时落两份，Steam 两个位置都会读
+                for dest in (self.steam_path / "config" / "depotcache", self.steam_path / "depotcache"):
+                    dest.mkdir(parents=True, exist_ok=True)
+                    for name, blob in manifest_blobs.items():
+                        (dest / name).write_bytes(blob)
+
+                if add_all_dlc:
+                    await self._add_free_dlcs_to_lua(app_id, lua_filepath)
+                if patch_depot_key:
+                    await self.patch_lua_with_depotkey(app_id, lua_filepath)
+            else:
+                # GreenLuma
+                depot_cache_path = self.steam_path / "depotcache"
+                depot_cache_path.mkdir(parents=True, exist_ok=True)
+                for name, blob in manifest_blobs.items():
+                    (depot_cache_path / name).write_bytes(blob)
+                if not manifest_blobs:
+                    self.log.error("清单包里没有 .manifest，GreenLuma 模式无法继续。")
+                    return False
+                if depot_keys:
+                    await self.depotkey_merge(
+                        self.steam_path / "config" / "config.vdf",
+                        {"depots": {d: {"DecryptionKey": k} for d, k in depot_keys.items()}},
+                    )
+                    await self.greenluma_add(list(set(list(depot_keys.keys()) + [str(app_id)])))
+                    self.log.info("已合并密钥并添加到GreenLuma。")
+
+            return True
+
+        except Exception as e:
+            self.log.error(f"处理 steamhub 清单时出错: {self.stack_error(e)}")
+            return False
+
     async def process_zip_source(self, app_id: str, tool_type: str, unlocker_type: str, use_st_auto_update: bool, add_all_dlc: bool, patch_depot_key: bool = False) -> bool:
         source_map = {
             "printedwaste": "https://api.printedwaste.com/gfk/download/{app_id}",
@@ -2750,6 +2912,7 @@ class CaiBackend:
             "steamautocracks_v2": "special",  # 特殊处理标识
             "buqiuren": "special",
             "steamtools_games": "special",
+            "steamhub": "special",
             "sudama": "special"
         }
         source_name_map = { 
@@ -2769,6 +2932,9 @@ class CaiBackend:
 
         if tool_type == "steamtools_games":
             return await self.process_steamtools_games_manifest(app_id, unlocker_type, use_st_auto_update, add_all_dlc, patch_depot_key)
+
+        if tool_type == "steamhub":
+            return await self.process_steamhub_manifest(app_id, unlocker_type, use_st_auto_update, add_all_dlc, patch_depot_key)
             
         if tool_type == "sudama":
             return await self.process_sudama_manifest(app_id, unlocker_type, use_st_auto_update, add_all_dlc, patch_depot_key)
